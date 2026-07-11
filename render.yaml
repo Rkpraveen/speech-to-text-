@@ -15,3 +15,20 @@ services:
         sync: false
       - key: SECRET_KEY
         generateValue: true
+
+  - type: web
+    name: speech-to-text-frontend
+    env: static
+    rootDir: frontend
+    region: oregon
+    buildCommand: "npm install && npm run build"
+    staticPublishPath: "./dist"
+    envVars:
+      - key: VITE_API_URL
+        value: "https://speech-to-text-mdof.onrender.com"
+      - key: VITE_WS_URL
+        value: "wss://speech-to-text-mdof.onrender.com"
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
