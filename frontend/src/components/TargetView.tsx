@@ -5,8 +5,7 @@ import { useWebSocket, type ConnectionState } from "@/hooks/useWebSocket";
 import { formatTime } from "@/lib/utils";
 
 // Auto-detect WebSocket URL from current page (works with ngrok proxy)
-const WS_BASE = import.meta.env.VITE_WS_URL ||
-  `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}`;
+const WS_BASE = import.meta.env.VITE_WS_URL || "wss://speech-to-text-mdof.onrender.com";
 
 interface TranscriptMessage {
   type: string;
