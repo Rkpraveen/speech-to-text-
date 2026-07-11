@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useNavigate } from "react-router-dom";
-import { Smartphone, Wifi, WifiOff, Copy, Maximize2, Volume2, Clock } from "lucide-react";
+import { Smartphone, Wifi, WifiOff, Copy, Maximize2, Volume2, Clock, Radio } from "lucide-react";
 import { useWebSocket, type ConnectionState } from "@/hooks/useWebSocket";
 import { formatTime } from "@/lib/utils";
 
@@ -256,6 +256,30 @@ export default function TargetView({ sessionId }: TargetViewProps) {
 
       {/* Bottom safe area for mobile */}
       <div className="h-2 shrink-0" style={{ background: "var(--color-bg-primary)" }} />
+
+      {/* Session Ended Overlay */}
+      {sessionEnded && (
+        <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-black/60 backdrop-blur-md">
+          <div className="bg-white/10 p-8 rounded-2xl flex flex-col items-center border border-white/20 max-w-sm w-full mx-4 shadow-2xl">
+            <div className="w-16 h-16 bg-red-500/20 text-red-400 rounded-full flex items-center justify-center mb-6">
+              <WifiOff size={32} />
+            </div>
+            <h2 className="text-2xl font-bold text-white mb-2">Live Session Ended</h2>
+            <p className="text-gray-300 text-center mb-8">
+              The host has ended this transcription stream.
+            </p>
+            <button
+              onClick={() => {
+                setSessionEnded(false);
+                navigate("/");
+              }}
+              className="w-full bg-white/20 hover:bg-white/30 text-white font-semibold py-3 rounded-xl transition-all"
+            >
+              Return Home
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
