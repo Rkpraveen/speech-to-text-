@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '@/contexts/AuthContext';
+import { API_BASE } from '@/lib/config';
 import { Mic, Radio, LogOut, Loader2 } from 'lucide-react';
 
 export default function DashboardView() {
@@ -14,7 +15,7 @@ export default function DashboardView() {
     setCreating(true);
     setError('');
     try {
-      const res = await fetch('/api/sessions/create', {
+      const res = await fetch(`${API_BASE}/api/sessions/create`, {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${token}`

@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
+import { API_BASE } from '@/lib/config';
 import { useAuth } from '@/contexts/AuthContext';
 import { UserPlus } from 'lucide-react';
 
@@ -18,7 +19,7 @@ export default function RegisterView() {
 
     try {
       // 1. Register
-      const regRes = await fetch('/api/register', {
+      const regRes = await fetch(`${API_BASE}/api/register`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username, password }),
@@ -30,7 +31,7 @@ export default function RegisterView() {
       }
 
       // 2. Login immediately after
-      const loginRes = await fetch('/api/login', {
+      const loginRes = await fetch(`${API_BASE}/api/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: new URLSearchParams({ username, password }),

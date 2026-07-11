@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "@/contexts/AuthContext";
+import { API_BASE } from "@/lib/config";
 import { useMicVAD } from "@ricky0123/vad-react";
 import { Mic, MicOff, Radio, Wifi, WifiOff, Copy, Clock } from "lucide-react";
 import { useWebSocket, type ConnectionState } from "@/hooks/useWebSocket";
@@ -91,7 +92,7 @@ export default function SourceView({ sessionId }: SourceViewProps) {
       vad.pause();
       disconnect();
       
-      await fetch(`/api/sessions/${sessionId}/end`, {
+      await fetch(`${API_BASE}/api/sessions/${sessionId}/end`, {
         method: "POST",
         headers: {
           "Authorization": `Bearer ${token}`
