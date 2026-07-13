@@ -140,7 +140,11 @@ async def get_me(current_user: dict = Depends(get_current_user)):
 async def ws_source(websocket: WebSocket, session_id: str):
     """
     Laptop connects here to stream audio.
-    Receives binary WAV chunks, transcribes via Groq, pushes to targets.
+    Supports dual-channel streaming:
+      - "interim" signals: transcribe and broadcast as live preview (no DB save)
+      - "final" signals: transcribe, broadcast, and persist to DB
+    The source sends a JSON text message {"signal": "interim"|"final"} before
+    each binary audio chunk to indicate the type.
     """
     await websocket.accept()
     session = register_source(session_id, websocket)
@@ -156,23 +160,47 @@ async def ws_source(websocket: WebSocket, session_id: str):
         "timestamp": _now(),
     })
 
+    # Track the pending signal type for the next binary chunk
+    pending_signal = "final"  # default for backward compatibility
+
     try:
         while True:
             # Receive message from laptop
             message = await websocket.receive()
-            
-            if "text" in message and message["text"] == "ping":
-                await websocket.send_text("pong")
+
+            # ── Handle text messages (signals + ping) ──
+            if "text" in message:
+                text_msg = message["text"]
+
+                if text_msg == "ping":
+                    await websocket.send_text("pong")
+                    continue
+
+                # Parse signal JSON: {"signal": "interim"} or {"signal": "final"}
+                try:
+                    parsed = json.loads(text_msg)
+                    if "signal" in parsed:
+                        pending_signal = parsed["signal"]  # "interim" or "final"
+                        continue
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
                 continue
-                
+
+            # ── Handle binary messages (audio chunks) ──
             if "bytes" not in message:
                 continue
-                
+
             data = message["bytes"]
 
             if len(data) < 100:
                 # Too small, likely an empty frame
+                pending_signal = "final"
                 continue
+
+            # Capture the signal type for this chunk, then reset to default
+            chunk_type = pending_signal
+            pending_signal = "final"
 
             # ── HOT PATH: Transcribe + Deliver ──
             t_start = time.perf_counter()
@@ -189,8 +217,8 @@ async def ws_source(websocket: WebSocket, session_id: str):
             duration_ms = result.get("duration")
             latency_ms = round((t_transcribe - t_start) * 1000, 1)
 
-            message = {
-                "type": "transcript",
+            transcript_message = {
+                "type": chunk_type,  # "interim" or "final"
                 "text": text,
                 "timestamp": _now(),
                 "latency_ms": latency_ms,
@@ -198,17 +226,20 @@ async def ws_source(websocket: WebSocket, session_id: str):
             }
 
             # Push to all target WebSockets (mobile)
-            await broadcast_to_targets(session_id, message)
+            await broadcast_to_targets(session_id, transcript_message)
 
             # Echo back to source (laptop) for preview
-            await notify_source(session_id, message)
+            await notify_source(session_id, transcript_message)
 
-            print(f"[Transcribed] ({latency_ms}ms) {text[:80]}")
+            if chunk_type == "interim":
+                print(f"[Interim] ({latency_ms}ms) {text[:60]}...")
+            else:
+                print(f"[Final] ({latency_ms}ms) {text[:80]}")
 
-            # Fire-and-forget: save to DB (NOT in hot path)
-            asyncio.create_task(
-                _safe_db_op(save_transcript(session_id, text, duration_ms))
-            )
+                # Fire-and-forget: save ONLY final transcripts to DB
+                asyncio.create_task(
+                    _safe_db_op(save_transcript(session_id, text, duration_ms))
+                )
 
     except WebSocketDisconnect:
         print(f"[Source] Disconnected: session={session_id}")

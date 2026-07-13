@@ -257,3 +257,97 @@ body {
   0%, 100% { background-position: 0% 50%; }
   50% { background-position: 100% 50%; }
 }
+
+/* ─── Live Interim Banner (Target View) ─────────────────────────────── */
+
+.live-banner {
+  padding: 16px 20px;
+  background: linear-gradient(135deg, rgba(99, 102, 241, 0.08), rgba(139, 92, 246, 0.06));
+  border-bottom: 1px solid rgba(99, 102, 241, 0.2);
+  animation: banner-glow 2s ease-in-out infinite;
+  position: relative;
+  overflow: hidden;
+}
+
+.live-banner::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(99, 102, 241, 0.05), transparent);
+  animation: shimmer 2s ease-in-out infinite;
+}
+
+.live-banner-indicator {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.live-banner-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--color-accent);
+  box-shadow: 0 0 8px var(--color-accent-glow);
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+.live-banner-label {
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  color: var(--color-accent);
+  font-family: var(--font-mono);
+}
+
+.live-banner-text {
+  font-size: clamp(1.1rem, 3.5vw, 1.6rem);
+  line-height: 1.6;
+  color: var(--color-text-primary);
+  position: relative;
+  z-index: 1;
+}
+
+/* ─── Typing Cursor ─────────────────────────────────────────────────── */
+
+.typing-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 1.2em;
+  background: var(--color-accent);
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  animation: blink-cursor 0.8s step-end infinite;
+}
+
+@keyframes blink-cursor {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+@keyframes banner-glow {
+  0%, 100% { box-shadow: inset 0 -1px 20px rgba(99, 102, 241, 0.05); }
+  50% { box-shadow: inset 0 -1px 30px rgba(99, 102, 241, 0.1); }
+}
+
+@keyframes shimmer {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
+/* ─── Interim Entry (Source View preview) ───────────────────────────── */
+
+.interim-entry {
+  border-left-color: var(--color-accent) !important;
+  background: rgba(99, 102, 241, 0.04);
+}
+
+.interim-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--color-accent);
+  animation: pulse 1s ease-in-out infinite;
+  display: inline-block;
+}

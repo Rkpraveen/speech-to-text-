@@ -71,8 +71,10 @@ async def broadcast_to_targets(session_id: str, message: dict):
     if not session:
         return
 
-    # Add to transcript history
-    session.transcripts.append(message)
+    # Only store non-interim messages in transcript history
+    # (interim messages are ephemeral live previews)
+    if message.get("type") != "interim":
+        session.transcripts.append(message)
 
     # Broadcast to all connected targets
     dead_targets = set()

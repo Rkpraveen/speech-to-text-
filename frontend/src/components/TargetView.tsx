@@ -1,10 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useNavigate } from "react-router-dom";
-import { Smartphone, Wifi, WifiOff, Copy, Maximize2, Volume2, Clock, Radio } from "lucide-react";
+import { Smartphone, Wifi, WifiOff, Maximize2, Volume2, Copy } from "lucide-react";
 import { useWebSocket, type ConnectionState } from "@/hooks/useWebSocket";
-import { formatTime } from "@/lib/utils";
 
-// Auto-detect WebSocket URL from current page (works with ngrok proxy)
 const WS_BASE = import.meta.env.VITE_WS_URL || "wss://speech-to-text-mdof.onrender.com";
 
 interface TranscriptMessage {
@@ -22,6 +20,7 @@ interface TargetViewProps {
 
 export default function TargetView({ sessionId }: TargetViewProps) {
   const [transcripts, setTranscripts] = useState<TranscriptMessage[]>([]);
+  const [interimText, setInterimText] = useState("");
   const [sourceConnected, setSourceConnected] = useState(false);
   const [, setIsFullscreen] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -31,18 +30,23 @@ export default function TargetView({ sessionId }: TargetViewProps) {
   const [joinSessionId, setJoinSessionId] = useState("");
   const navigate = useNavigate();
 
-  // WebSocket connection to receive transcripts
   const handleMessage = useCallback((data: TranscriptMessage) => {
-    if (data.type === "transcript" && data.text) {
+    if (data.type === "interim" && data.text) {
+      setInterimText(data.text);
+    } else if (data.type === "final" && data.text) {
+      setInterimText("");
+      setTranscripts((prev) => [...prev, data]);
+    } else if (data.type === "transcript" && data.text) {
+      setInterimText("");
       setTranscripts((prev) => [...prev, data]);
     } else if (data.type === "end_session") {
       setSessionEnded(true);
       setSourceConnected(false);
     } else if (data.type === "status") {
-      if (data.status === "source_connected") {
-        setSourceConnected(true);
-      } else if (data.status === "source_disconnected") {
+      if (data.status === "source_connected") setSourceConnected(true);
+      else if (data.status === "source_disconnected") {
         setSourceConnected(false);
+        setInterimText("");
       } else if (data.status === "connected" && data.has_source !== undefined) {
         setSourceConnected(data.has_source as boolean);
       }
@@ -54,24 +58,20 @@ export default function TargetView({ sessionId }: TargetViewProps) {
     onMessage: handleMessage,
   });
 
-  // Auto-connect on mount if sessionId is present
   useEffect(() => {
-    if (sessionId) {
-      connect();
-    }
+    if (sessionId) connect();
   }, [connect, sessionId]);
 
-  // Auto-scroll to bottom
+  // Auto-scroll to top when new stream arrives
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTo({
-        top: scrollRef.current.scrollHeight,
+        top: 0,
         behavior: "smooth",
       });
     }
-  }, [transcripts]);
+  }, [transcripts, interimText]);
 
-  // Fullscreen toggle
   const toggleFullscreen = () => {
     if (!document.fullscreenElement) {
       containerRef.current?.requestFullscreen();
@@ -82,32 +82,16 @@ export default function TargetView({ sessionId }: TargetViewProps) {
     }
   };
 
-  // Copy all text
   const copyAll = () => {
-    const text = transcripts
-      .filter((t) => t.type === "transcript")
-      .map((t) => t.text)
-      .join(" ");
+    const text = transcripts.map((t) => t.text).join(" ");
     navigator.clipboard.writeText(text);
   };
 
-  const lastTranscript = transcripts.filter((t) => t.type === "transcript").at(-1);
-
   if (!sessionId) {
     return (
-      <div className="min-h-screen bg-[#0a0a0f] flex items-center justify-center p-6 text-white relative overflow-hidden">
-        {/* Background accents */}
-        <div className="absolute top-1/4 left-1/4 w-[500px] h-[500px] bg-purple-500/10 rounded-full blur-[120px] pointer-events-none" />
-        <div className="absolute bottom-1/4 right-1/4 w-[500px] h-[500px] bg-blue-500/10 rounded-full blur-[120px] pointer-events-none" />
-        
-        <div className="bg-white/5 border border-white/10 rounded-2xl p-8 backdrop-blur-sm flex flex-col items-center text-center max-w-md w-full relative z-10 shadow-2xl">
-          <div className="w-20 h-20 bg-purple-500/20 text-purple-400 rounded-full flex items-center justify-center mb-6">
-            <Radio size={40} />
-          </div>
-          <h2 className="text-2xl font-bold mb-3">Join a Live Stream</h2>
-          <p className="text-gray-400 mb-8 text-sm">
-            Enter the 6-character session code provided by the host to view the live transcription.
-          </p>
+      <div className="min-h-screen bg-[#0a0a0f] flex items-center justify-center p-6 text-white relative">
+        <div className="bg-white/5 border border-white/10 rounded-2xl p-8 max-w-md w-full relative z-10 shadow-2xl">
+          <h2 className="text-2xl font-bold mb-3 text-center">Join Stream</h2>
           <form 
             onSubmit={(e) => {
               e.preventDefault();
@@ -115,166 +99,113 @@ export default function TargetView({ sessionId }: TargetViewProps) {
             }} 
             className="w-full"
           >
-            <div className="flex flex-col gap-3">
-              <input
-                type="text"
-                placeholder="e.g. M9ARWM"
-                value={joinSessionId}
-                onChange={(e) => setJoinSessionId(e.target.value.toUpperCase())}
-                className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-4 text-white uppercase text-center text-lg focus:outline-none focus:border-purple-500/50 focus:ring-1 focus:ring-purple-500/50 transition-all"
-                maxLength={6}
-              />
-              <button
-                type="submit"
-                disabled={joinSessionId.length < 2}
-                className="w-full bg-purple-600 hover:bg-purple-500 text-white font-semibold py-4 rounded-xl transition-all disabled:opacity-50"
-              >
-                Connect to Stream
-              </button>
-            </div>
+            <input
+              type="text"
+              placeholder="Session Code"
+              value={joinSessionId}
+              onChange={(e) => setJoinSessionId(e.target.value.toUpperCase())}
+              className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-4 text-white uppercase text-center text-lg mb-3"
+              maxLength={6}
+            />
+            <button
+              type="submit"
+              disabled={joinSessionId.length < 2}
+              className="w-full bg-purple-600 text-white font-semibold py-4 rounded-xl disabled:opacity-50"
+            >
+              Connect
+            </button>
           </form>
         </div>
       </div>
     );
   }
 
+  const hasInterim = interimText.length > 0;
+
   return (
     <div
       ref={containerRef}
-      className="h-full flex flex-col"
+      className="h-full flex flex-col relative"
       style={{ background: "var(--color-bg-primary)" }}
     >
-      {/* Top Bar — Minimal for mobile */}
-      <header
-        className="flex items-center justify-between px-4 py-3 border-b shrink-0"
-        style={{ borderColor: "var(--color-border)" }}
-      >
+      {/* ─── Header ─── */}
+      <header className="flex items-center justify-between px-4 py-3 border-b border-white/10 shrink-0">
         <div className="flex items-center gap-2">
-          <Smartphone className="w-4 h-4" style={{ color: "var(--color-accent)" }} />
-          <span className="text-sm font-medium" style={{ color: "var(--color-text-primary)" }}>
-            Live
-          </span>
-          <span
-            className="text-xs font-mono px-1.5 py-0.5 rounded"
-            style={{ background: "var(--color-bg-card)", color: "var(--color-text-muted)" }}
-          >
+          <Smartphone className="w-4 h-4 text-purple-400" />
+          <span className="text-sm font-medium text-white">Live</span>
+          <span className="text-xs font-mono px-1.5 py-0.5 rounded bg-white/10 text-gray-400">
             {sessionId}
           </span>
         </div>
-
-        <div className="flex items-center gap-3">
-          {/* Source status */}
-          <div className="flex items-center gap-1.5 text-xs" style={{ color: sourceConnected ? "var(--color-success)" : "var(--color-text-muted)" }}>
+        <div className="flex items-center gap-4">
+          <div className="flex items-center gap-1.5 text-xs text-gray-400">
             <Volume2 className="w-3.5 h-3.5" />
-            {sourceConnected ? "Source live" : "No source"}
+            <span style={{ color: sourceConnected ? "#10b981" : "inherit" }}>
+              {sourceConnected ? "Source live" : "No source"}
+            </span>
           </div>
-
-          {/* Connection status */}
           <TargetConnectionBadge state={connectionState} />
-
-          {/* Actions */}
-          <button onClick={copyAll} className="p-1.5 rounded-md hover:bg-white/5 transition-colors" title="Copy all">
-            <Copy className="w-4 h-4" style={{ color: "var(--color-text-muted)" }} />
+          <button onClick={copyAll} className="p-1.5 hover:bg-white/10 rounded">
+            <Copy className="w-4 h-4 text-gray-400" />
           </button>
-          <button onClick={toggleFullscreen} className="p-1.5 rounded-md hover:bg-white/5 transition-colors" title="Fullscreen">
-            <Maximize2 className="w-4 h-4" style={{ color: "var(--color-text-muted)" }} />
+          <button onClick={toggleFullscreen} className="p-1.5 hover:bg-white/10 rounded">
+            <Maximize2 className="w-4 h-4 text-gray-400" />
           </button>
         </div>
       </header>
 
-      {/* Main Text Display Area */}
-      <div
-        ref={scrollRef}
-        className="flex-1 overflow-y-auto p-6"
-        style={{ scrollBehavior: "smooth" }}
+      {/* ─── Scrollable Continuous Text Area ─── */}
+      <div 
+        ref={scrollRef} 
+        className="flex-1 overflow-y-auto p-4 md:p-8 flex flex-col gap-4 pb-32"
       >
-        {transcripts.length === 0 ? (
-          <div className="h-full flex flex-col items-center justify-center gap-4">
-            <div
-              className="w-16 h-16 rounded-full flex items-center justify-center"
-              style={{
-                background: "var(--color-bg-card)",
-                border: "2px solid var(--color-border)",
-              }}
-            >
-              <Volume2 className="w-7 h-7" style={{ color: "var(--color-text-muted)" }} />
-            </div>
-            <div className="text-center">
-              <p className="text-lg font-medium" style={{ color: "var(--color-text-secondary)" }}>
-                Waiting for speech...
-              </p>
-              <p className="text-sm mt-1" style={{ color: "var(--color-text-muted)" }}>
-                {connectionState === "connected"
-                  ? sourceConnected
-                    ? "Source is connected. Speak into the laptop mic."
-                    : "Connected. Waiting for source to connect."
-                  : "Connecting to server..."}
-              </p>
-            </div>
+        {transcripts.length === 0 && !hasInterim ? (
+          <div className="flex-1 flex flex-col items-center justify-center text-center opacity-50 mt-20">
+            <Volume2 className="w-12 h-12 mb-4" />
+            <p className="text-lg">Waiting for speech...</p>
           </div>
         ) : (
-          <div className="max-w-3xl mx-auto">
-            {/* Continuous text display */}
-            <div className="target-text-display">
-              {transcripts
-                .filter((t) => t.type === "transcript" && t.text)
-                .map((t, i) => (
-                  <span
-                    key={i}
-                    className={i === transcripts.filter((t) => t.type === "transcript").length - 1 ? "new-word" : ""}
-                  >
-                    {t.text}{" "}
-                  </span>
-                ))}
+          <>
+            {/* 1. LATEST STREAM AT THE VERY TOP (Large Font) */}
+            <div className="shrink-0 mb-4 transition-all duration-300">
+              {hasInterim ? (
+                <div className="text-3xl md:text-5xl text-white font-medium leading-tight italic">
+                  {interimText}
+                  <span className="typing-cursor ml-2" />
+                </div>
+              ) : (
+                transcripts.length > 0 && (
+                  <div className="text-3xl md:text-5xl text-white font-medium leading-tight">
+                    {transcripts[transcripts.length - 1].text}
+                  </div>
+                )
+              )}
             </div>
 
-            {/* Latest transcript metadata */}
-            {lastTranscript && (
-              <div className="mt-6 flex items-center gap-4 text-xs" style={{ color: "var(--color-text-muted)" }}>
-                <div className="flex items-center gap-1">
-                  <Clock className="w-3 h-3" />
-                  {lastTranscript.timestamp && formatTime(lastTranscript.timestamp)}
-                </div>
-                {lastTranscript.latency_ms && (
-                  <div
-                    className="font-mono"
-                    style={{
-                      color: lastTranscript.latency_ms < 300 ? "var(--color-success)" : "var(--color-warning)",
-                    }}
+            {/* 2. HISTORY AT THE BOTTOM (Small Font, Reverse Chronological) */}
+            <div className="flex flex-col gap-3 opacity-60">
+              {[...transcripts]
+                .slice(0, hasInterim ? transcripts.length : transcripts.length - 1)
+                .reverse()
+                .map((t, i) => (
+                  <div 
+                    key={i} 
+                    className="text-base md:text-xl text-gray-300 leading-relaxed"
                   >
-                    ⚡ {lastTranscript.latency_ms}ms
+                    {t.text}
                   </div>
-                )}
-                <div className="font-mono">
-                  {transcripts.filter((t) => t.type === "transcript").length} segments
-                </div>
-              </div>
-            )}
-          </div>
+                ))}
+            </div>
+          </>
         )}
       </div>
 
-      {/* Bottom safe area for mobile */}
-      <div className="h-2 shrink-0" style={{ background: "var(--color-bg-primary)" }} />
-
-      {/* Session Ended Overlay */}
       {sessionEnded && (
-        <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-black/60 backdrop-blur-md">
-          <div className="bg-white/10 p-8 rounded-2xl flex flex-col items-center border border-white/20 max-w-sm w-full mx-4 shadow-2xl">
-            <div className="w-16 h-16 bg-red-500/20 text-red-400 rounded-full flex items-center justify-center mb-6">
-              <WifiOff size={32} />
-            </div>
-            <h2 className="text-2xl font-bold text-white mb-2">Live Session Ended</h2>
-            <p className="text-gray-300 text-center mb-8">
-              The host has ended this transcription stream.
-            </p>
-            <button
-              onClick={() => {
-                setSessionEnded(false);
-                navigate("/");
-              }}
-              className="w-full bg-white/20 hover:bg-white/30 text-white font-semibold py-3 rounded-xl transition-all"
-            >
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/80">
+          <div className="bg-white/10 p-8 rounded-2xl text-center border border-white/20">
+            <WifiOff size={48} className="text-red-400 mx-auto mb-4" />
+            <h2 className="text-2xl font-bold text-white mb-2">Session Ended</h2>
+            <button onClick={() => navigate("/")} className="mt-4 px-6 py-2 bg-white/20 rounded-lg text-white">
               Return Home
             </button>
           </div>
@@ -284,14 +215,13 @@ export default function TargetView({ sessionId }: TargetViewProps) {
   );
 }
 
-/* ─── Sub-components ──────────────────────────────────────────────── */
-
 function TargetConnectionBadge({ state }: { state: ConnectionState }) {
   const Icon = state === "connected" ? Wifi : WifiOff;
+  const color = state === "connected" ? "#10b981" : state === "connecting" ? "#f59e0b" : "#ef4444";
   return (
     <div className="flex items-center gap-1.5">
-      <span className={`status-dot ${state}`} />
-      <Icon className="w-3.5 h-3.5" style={{ color: "var(--color-text-muted)" }} />
+      <div className="w-2 h-2 rounded-full" style={{ backgroundColor: color }} />
+      <Icon className="w-3.5 h-3.5 text-gray-400" />
     </div>
   );
 }

@@ -81,3 +81,18 @@ export function calculateRMS(samples: Float32Array): number {
   }
   return Math.sqrt(sum / samples.length);
 }
+
+/**
+ * Concatenate multiple Float32Arrays into a single Float32Array.
+ * Used to accumulate speech frames for interim streaming chunks.
+ */
+export function concatFloat32Arrays(arrays: Float32Array[]): Float32Array {
+  const totalLength = arrays.reduce((sum, arr) => sum + arr.length, 0);
+  const result = new Float32Array(totalLength);
+  let offset = 0;
+  for (const arr of arrays) {
+    result.set(arr, offset);
+    offset += arr.length;
+  }
+  return result;
+}

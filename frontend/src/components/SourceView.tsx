@@ -5,11 +5,14 @@ import { API_BASE } from "@/lib/config";
 import { useMicVAD } from "@ricky0123/vad-react";
 import { Mic, MicOff, Radio, Wifi, WifiOff, Copy, Clock } from "lucide-react";
 import { useWebSocket, type ConnectionState } from "@/hooks/useWebSocket";
-import { float32ToWav } from "@/lib/audio-utils";
+import { float32ToWav, concatFloat32Arrays } from "@/lib/audio-utils";
 import { formatTime } from "@/lib/utils";
 
 // Auto-detect WebSocket URL from current page (works with ngrok proxy)
 const WS_BASE = import.meta.env.VITE_WS_URL || "wss://speech-to-text-mdof.onrender.com";
+
+// Interim streaming interval: send accumulated audio every ~1 second
+const INTERIM_INTERVAL_MS = 1000;
 
 interface TranscriptMessage {
   type: string;
@@ -26,44 +29,125 @@ interface SourceViewProps {
 export default function SourceView({ sessionId }: SourceViewProps) {
   const [isRecording, setIsRecording] = useState(false);
   const [transcripts, setTranscripts] = useState<TranscriptMessage[]>([]);
+  const [interimText, setInterimText] = useState("");
   const [wordCount, setWordCount] = useState(0);
   const [chunksSent, setChunksSent] = useState(0);
   const navigate = useNavigate();
   const { token } = useAuth();
   const scrollRef = useRef<HTMLDivElement>(null);
 
+  // Interim streaming refs
+  const speechFramesRef = useRef<Float32Array[]>([]);
+  const interimTimerRef = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
+  const isSpeakingRef = useRef(false);
+
   // WebSocket connection to backend
   const handleMessage = useCallback((data: TranscriptMessage) => {
-    if (data.type === "transcript" && data.text) {
+    if (data.type === "final" && data.text) {
+      // Final transcript — add to permanent history
+      setTranscripts((prev) => [...prev, data]);
+      setWordCount((prev) => prev + (data.text?.split(/\s+/).length || 0));
+      setInterimText(""); // Clear interim preview
+    } else if (data.type === "interim" && data.text) {
+      // Interim transcript — update live preview (replaces, doesn't append)
+      setInterimText(data.text);
+    } else if (data.type === "transcript" && data.text) {
+      // Backward compatibility with old format
       setTranscripts((prev) => [...prev, data]);
       setWordCount((prev) => prev + (data.text?.split(/\s+/).length || 0));
     }
   }, []);
 
-  const { connectionState, connect, disconnect, sendBinary } = useWebSocket({
+  const { connectionState, connect, disconnect, sendBinary, sendJson } = useWebSocket({
     url: `${WS_BASE}/ws/source/${sessionId}`,
     onMessage: handleMessage,
   });
+
+  /**
+   * Send an audio chunk with a signal type prefix.
+   * Protocol: send JSON {"signal": type} then binary audio data.
+   */
+  const sendAudioChunk = useCallback((audioBuffer: ArrayBuffer, signal: "interim" | "final") => {
+    if (connectionState !== "connected") return;
+    sendJson({ signal });
+    sendBinary(audioBuffer);
+    setChunksSent((prev) => prev + 1);
+  }, [connectionState, sendJson, sendBinary]);
+
+  /**
+   * Send the currently accumulated speech frames as an interim chunk.
+   */
+  const sendInterimChunk = useCallback(() => {
+    if (speechFramesRef.current.length === 0) return;
+    if (connectionState !== "connected") return;
+
+    // Concatenate all accumulated frames
+    const combined = concatFloat32Arrays(speechFramesRef.current);
+    const wavBlob = float32ToWav(combined, 16000);
+    wavBlob.arrayBuffer().then((buffer) => {
+      sendAudioChunk(buffer, "interim");
+    });
+  }, [connectionState, sendAudioChunk]);
+
+  /**
+   * Start the interim streaming timer — fires every INTERIM_INTERVAL_MS
+   * while the user is speaking.
+   */
+  const startInterimTimer = useCallback(() => {
+    stopInterimTimer();
+    interimTimerRef.current = setInterval(() => {
+      if (isSpeakingRef.current) {
+        sendInterimChunk();
+      }
+    }, INTERIM_INTERVAL_MS);
+  }, [sendInterimChunk]);
+
+  const stopInterimTimer = useCallback(() => {
+    if (interimTimerRef.current !== undefined) {
+      clearInterval(interimTimerRef.current);
+      interimTimerRef.current = undefined;
+    }
+  }, []);
 
   // VAD — Voice Activity Detection
   const vad = useMicVAD({
     startOnLoad: true,
     baseAssetPath: "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.30/dist/",
     onnxWASMBasePath: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/",
+
+    onSpeechStart: () => {
+      // User started speaking — reset the frame buffer and start interim timer
+      speechFramesRef.current = [];
+      isSpeakingRef.current = true;
+      startInterimTimer();
+    },
+
+    onFrameProcessed: (probs: { isSpeech: number }, frame: Float32Array) => {
+      // Accumulate every speech frame into the buffer
+      // (VAD fires this callback ~30x/sec with 512 samples each)
+      if (isSpeakingRef.current && probs.isSpeech > 0.3) {
+        speechFramesRef.current.push(new Float32Array(frame));
+      }
+    },
+
     onSpeechEnd: (audio: Float32Array) => {
+      // User stopped speaking — send the full utterance as a "final" chunk
+      isSpeakingRef.current = false;
+      stopInterimTimer();
+      speechFramesRef.current = [];
+
       if (connectionState !== "connected") return;
 
-      // Convert to WAV and send
       const wavBlob = float32ToWav(audio, 16000);
       wavBlob.arrayBuffer().then((buffer) => {
-        sendBinary(buffer);
-        setChunksSent((prev) => prev + 1);
+        sendAudioChunk(buffer, "final");
       });
     },
+
     positiveSpeechThreshold: 0.8,
     negativeSpeechThreshold: 0.3,
-    minSpeechMs: 100,      // Reduced from 200: capture smaller fragments
-    redemptionMs: 150,     // Reduced from 400: chop speech immediately on tiny pauses
+    minSpeechMs: 100,
+    redemptionMs: 150,
   });
 
   // Auto-connect WebSocket on load
@@ -72,24 +156,32 @@ export default function SourceView({ sessionId }: SourceViewProps) {
     setIsRecording(true);
   }, [connect]);
 
+  // Cleanup interim timer on unmount
+  useEffect(() => {
+    return () => stopInterimTimer();
+  }, [stopInterimTimer]);
+
   // Start/stop recording (manual toggle still supported)
   const toggleRecording = useCallback(() => {
     if (isRecording) {
       vad.pause();
       disconnect();
+      stopInterimTimer();
       setIsRecording(false);
+      setInterimText("");
     } else {
       connect();
       vad.start();
       setIsRecording(true);
     }
-  }, [isRecording, vad, connect, disconnect]);
+  }, [isRecording, vad, connect, disconnect, stopInterimTimer]);
 
   // End Session
   const endSession = async () => {
     try {
       vad.pause();
       disconnect();
+      stopInterimTimer();
       
       await fetch(`${API_BASE}/api/sessions/${sessionId}/end`, {
         method: "POST",
@@ -110,12 +202,12 @@ export default function SourceView({ sessionId }: SourceViewProps) {
       top: scrollRef.current.scrollHeight,
       behavior: "smooth",
     });
-  }, [transcripts]);
+  }, [transcripts, interimText]);
 
   // Copy all transcripts
   const copyTranscripts = () => {
     const text = transcripts
-      .filter((t) => t.type === "transcript")
+      .filter((t) => t.type === "final" || t.type === "transcript")
       .map((t) => t.text)
       .join(" ");
     navigator.clipboard.writeText(text);
@@ -184,7 +276,7 @@ export default function SourceView({ sessionId }: SourceViewProps) {
             ? "Loading VAD model..."
             : isRecording
             ? vad.userSpeaking
-              ? "🎙️ Listening..."
+              ? "🎙️ Streaming live..."
               : "Waiting for speech..."
             : "Click to start recording"}
         </p>
@@ -213,27 +305,43 @@ export default function SourceView({ sessionId }: SourceViewProps) {
           )}
         </div>
         <div ref={scrollRef} className="overflow-y-auto p-4" style={{ maxHeight: "calc(35vh - 44px)" }}>
-          {transcripts.length === 0 ? (
+          {transcripts.length === 0 && !interimText ? (
             <p className="text-sm text-center py-4" style={{ color: "var(--color-text-muted)" }}>
               Transcripts will appear here...
             </p>
           ) : (
-            transcripts
-              .filter((t) => t.type === "transcript")
-              .map((t, i) => (
-                <div key={i} className="transcript-entry">
-                  <div className="flex items-center gap-2 timestamp">
-                    <Clock className="w-3 h-3" />
-                    {t.timestamp && formatTime(t.timestamp)}
-                    {t.latency_ms && (
-                      <span style={{ color: t.latency_ms < 300 ? "var(--color-success)" : "var(--color-warning)" }}>
-                        {t.latency_ms}ms
-                      </span>
-                    )}
+            <>
+              {/* Final transcripts */}
+              {transcripts
+                .filter((t) => t.type === "final" || t.type === "transcript")
+                .map((t, i) => (
+                  <div key={i} className="transcript-entry">
+                    <div className="flex items-center gap-2 timestamp">
+                      <Clock className="w-3 h-3" />
+                      {t.timestamp && formatTime(t.timestamp)}
+                      {t.latency_ms && (
+                        <span style={{ color: t.latency_ms < 300 ? "var(--color-success)" : "var(--color-warning)" }}>
+                          {t.latency_ms}ms
+                        </span>
+                      )}
+                    </div>
+                    <div className="text">{t.text}</div>
                   </div>
-                  <div className="text">{t.text}</div>
+                ))}
+
+              {/* Live interim preview */}
+              {interimText && (
+                <div className="transcript-entry interim-entry">
+                  <div className="flex items-center gap-2 timestamp">
+                    <span className="interim-dot" />
+                    <span style={{ color: "var(--color-accent)", fontSize: "0.7rem" }}>LIVE</span>
+                  </div>
+                  <div className="text" style={{ color: "var(--color-text-secondary)", fontStyle: "italic" }}>
+                    {interimText}
+                  </div>
                 </div>
-              ))
+              )}
+            </>
           )}
         </div>
       </div>
