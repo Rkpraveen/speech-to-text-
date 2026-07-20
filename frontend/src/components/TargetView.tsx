@@ -1,9 +1,9 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useNavigate } from "react-router-dom";
-import { Smartphone, Wifi, WifiOff, Maximize2, Volume2, Copy } from "lucide-react";
-import { useWebSocket, type ConnectionState } from "@/hooks/useWebSocket";
+import { useSSE, type ConnectionState } from "@/hooks/useSSE";
+import { API_BASE } from "@/lib/config";
 
-const WS_BASE = import.meta.env.VITE_WS_URL || "wss://speech-to-text-mdof.onrender.com";
+import { Wifi, WifiOff, Copy, Maximize2 } from "lucide-react";
 
 interface TranscriptMessage {
   type: string;
@@ -25,10 +25,15 @@ export default function TargetView({ sessionId }: TargetViewProps) {
   const [, setIsFullscreen] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const bottomRef = useRef<HTMLDivElement>(null);
+  const navigate = useNavigate();
 
   const [sessionEnded, setSessionEnded] = useState(false);
   const [joinSessionId, setJoinSessionId] = useState("");
-  const navigate = useNavigate();
+  const [copyFeedback, setCopyFeedback] = useState(false);
+
+  // Store disconnect ref so handleMessage can call it without circular deps
+  const disconnectRef = useRef<() => void>(() => {});
 
   const handleMessage = useCallback((data: TranscriptMessage) => {
     if (data.type === "interim" && data.text) {
@@ -42,6 +47,9 @@ export default function TargetView({ sessionId }: TargetViewProps) {
     } else if (data.type === "end_session") {
       setSessionEnded(true);
       setSourceConnected(false);
+      setInterimText("");
+      // Stop SSE — prevent reconnection loop after session ends
+      disconnectRef.current();
     } else if (data.type === "status") {
       if (data.status === "source_connected") setSourceConnected(true);
       else if (data.status === "source_disconnected") {
@@ -53,22 +61,44 @@ export default function TargetView({ sessionId }: TargetViewProps) {
     }
   }, []);
 
-  const { connectionState, connect } = useWebSocket({
-    url: sessionId ? `${WS_BASE}/ws/target/${sessionId}` : "",
+  const { connectionState, connect, disconnect } = useSSE({
+    url: sessionId ? `${API_BASE}/api/stream/${sessionId}` : "",
     onMessage: handleMessage,
   });
+
+  // Keep disconnect ref in sync
+  useEffect(() => {
+    disconnectRef.current = disconnect;
+  }, [disconnect]);
+
+  // Load existing transcripts from DB on mount (survives reload)
+  useEffect(() => {
+    if (!sessionId) return;
+    fetch(`${API_BASE}/api/sessions/${sessionId}/transcripts`)
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.transcripts && data.transcripts.length > 0) {
+          const restored = data.transcripts.map(
+            (t: { text: string; timestamp?: string }) => ({
+              type: "final",
+              text: t.text,
+              timestamp: t.timestamp,
+            })
+          );
+          setTranscripts(restored);
+        }
+      })
+      .catch((err) => console.error("[TargetView] Failed to load history:", err));
+  }, [sessionId]);
 
   useEffect(() => {
     if (sessionId) connect();
   }, [connect, sessionId]);
 
-  // Auto-scroll to top when new stream arrives
+  // Instant scroll to bottom — no smooth animation for real-time feel
   useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTo({
-        top: 0,
-        behavior: "smooth",
-      });
+    if (bottomRef.current) {
+      bottomRef.current.scrollIntoView({ behavior: "instant" });
     }
   }, [transcripts, interimText]);
 
@@ -83,34 +113,92 @@ export default function TargetView({ sessionId }: TargetViewProps) {
   };
 
   const copyAll = () => {
-    const text = transcripts.map((t) => t.text).join(" ");
+    const text = transcripts
+      .map((t) => t.text)
+      .filter(Boolean)
+      .join(" ");
     navigator.clipboard.writeText(text);
+    setCopyFeedback(true);
+    setTimeout(() => setCopyFeedback(false), 2000);
   };
 
+  // ─── No session: join form ───
   if (!sessionId) {
     return (
-      <div className="min-h-screen bg-[#0a0a0f] flex items-center justify-center p-6 text-white relative">
-        <div className="bg-white/5 border border-white/10 rounded-2xl p-8 max-w-md w-full relative z-10 shadow-2xl">
-          <h2 className="text-2xl font-bold mb-3 text-center">Join Stream</h2>
-          <form 
+      <div
+        style={{
+          minHeight: "100vh",
+          background: "#000",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          padding: "24px",
+        }}
+      >
+        <div
+          style={{
+            background: "#050505",
+            border: "1px solid #1a1a1a",
+            padding: "40px",
+            maxWidth: "400px",
+            width: "100%",
+          }}
+        >
+          <h2
+            style={{
+              fontFamily: "var(--font-mono)",
+              fontSize: "1rem",
+              fontWeight: 500,
+              color: "#e0e0e0",
+              marginBottom: "24px",
+            }}
+          >
+            Join Stream
+          </h2>
+          <form
             onSubmit={(e) => {
               e.preventDefault();
-              if (joinSessionId.trim()) navigate(`/live?session=${joinSessionId.trim().toUpperCase()}`);
-            }} 
-            className="w-full"
+              if (joinSessionId.trim())
+                navigate(`/live?session=${joinSessionId.trim().toUpperCase()}`);
+            }}
           >
             <input
               type="text"
-              placeholder="Session Code"
+              placeholder="Session code"
               value={joinSessionId}
               onChange={(e) => setJoinSessionId(e.target.value.toUpperCase())}
-              className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-4 text-white uppercase text-center text-lg mb-3"
               maxLength={6}
+              style={{
+                width: "100%",
+                background: "#000",
+                border: "1px solid #1a1a1a",
+                padding: "12px 16px",
+                color: "#e0e0e0",
+                fontFamily: "var(--font-mono)",
+                fontSize: "1.1rem",
+                textTransform: "uppercase",
+                textAlign: "center",
+                letterSpacing: "0.15em",
+                outline: "none",
+                marginBottom: "12px",
+              }}
             />
             <button
               type="submit"
               disabled={joinSessionId.length < 2}
-              className="w-full bg-purple-600 text-white font-semibold py-4 rounded-xl disabled:opacity-50"
+              style={{
+                width: "100%",
+                background: "transparent",
+                border: "1px solid var(--color-accent)",
+                color: "var(--color-accent)",
+                fontFamily: "var(--font-mono)",
+                fontSize: "0.85rem",
+                fontWeight: 500,
+                padding: "12px",
+                cursor: "pointer",
+                opacity: joinSessionId.length < 2 ? 0.3 : 1,
+                transition: "opacity 0.15s",
+              }}
             >
               Connect
             </button>
@@ -121,91 +209,227 @@ export default function TargetView({ sessionId }: TargetViewProps) {
   }
 
   const hasInterim = interimText.length > 0;
+  const hasContent = transcripts.length > 0 || hasInterim;
 
   return (
     <div
       ref={containerRef}
-      className="h-full flex flex-col relative"
-      style={{ background: "var(--color-bg-primary)" }}
+      style={{
+        height: "100%",
+        display: "flex",
+        flexDirection: "column",
+        background: "#000",
+        color: "#e0e0e0",
+        fontFamily: "var(--font-mono)",
+        position: "relative",
+      }}
     >
       {/* ─── Header ─── */}
-      <header className="flex items-center justify-between px-4 py-3 border-b border-white/10 shrink-0">
-        <div className="flex items-center gap-2">
-          <Smartphone className="w-4 h-4 text-purple-400" />
-          <span className="text-sm font-medium text-white">Live</span>
-          <span className="text-xs font-mono px-1.5 py-0.5 rounded bg-white/10 text-gray-400">
+      <header
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          padding: "10px 16px",
+          borderBottom: "1px solid #1a1a1a",
+          flexShrink: 0,
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+          <span
+            style={{
+              fontSize: "0.7rem",
+              fontWeight: 500,
+              color: "#e0e0e0",
+              letterSpacing: "0.08em",
+            }}
+          >
+            LIVE
+          </span>
+          <span
+            style={{
+              fontSize: "0.75rem",
+              padding: "2px 8px",
+              border: "1px solid #1a1a1a",
+              color: "#777",
+              letterSpacing: "0.1em",
+            }}
+          >
             {sessionId}
           </span>
         </div>
-        <div className="flex items-center gap-4">
-          <div className="flex items-center gap-1.5 text-xs text-gray-400">
-            <Volume2 className="w-3.5 h-3.5" />
-            <span style={{ color: sourceConnected ? "#10b981" : "inherit" }}>
-              {sourceConnected ? "Source live" : "No source"}
-            </span>
+        <div style={{ display: "flex", alignItems: "center", gap: "16px" }}>
+          {/* Source status */}
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "6px",
+              fontSize: "0.65rem",
+              color: sourceConnected ? "var(--color-accent)" : "#444",
+            }}
+          >
+            <div
+              style={{
+                width: "6px",
+                height: "6px",
+                background: sourceConnected ? "var(--color-accent)" : "#444",
+                boxShadow: sourceConnected
+                  ? "0 0 6px var(--color-accent-glow)"
+                  : "none",
+              }}
+            />
+            {sourceConnected ? "SRC" : "NO SRC"}
           </div>
+
+          {/* Connection badge */}
           <TargetConnectionBadge state={connectionState} />
-          <button onClick={copyAll} className="p-1.5 hover:bg-white/10 rounded">
-            <Copy className="w-4 h-4 text-gray-400" />
+
+          {/* Actions */}
+          <button
+            onClick={copyAll}
+            style={{
+              background: "none",
+              border: "none",
+              cursor: "pointer",
+              padding: "4px",
+              color: "#444",
+            }}
+          >
+            <Copy style={{ width: "14px", height: "14px" }} />
+            {copyFeedback && (
+              <span style={{ fontSize: "0.6rem", color: "var(--color-accent)" }}>Copied!</span>
+            )}
           </button>
-          <button onClick={toggleFullscreen} className="p-1.5 hover:bg-white/10 rounded">
-            <Maximize2 className="w-4 h-4 text-gray-400" />
+          <button
+            onClick={toggleFullscreen}
+            style={{
+              background: "none",
+              border: "none",
+              cursor: "pointer",
+              padding: "4px",
+              color: "#444",
+            }}
+          >
+            <Maximize2 style={{ width: "14px", height: "14px" }} />
           </button>
         </div>
       </header>
 
-      {/* ─── Scrollable Continuous Text Area ─── */}
-      <div 
-        ref={scrollRef} 
-        className="flex-1 overflow-y-auto p-4 md:p-8 flex flex-col gap-4 pb-32"
+      {/* ─── Scrollable transcript area ─── */}
+      <div
+        ref={scrollRef}
+        style={{
+          flex: 1,
+          overflowY: "auto",
+          padding: "20px 24px",
+        }}
       >
-        {transcripts.length === 0 && !hasInterim ? (
-          <div className="flex-1 flex flex-col items-center justify-center text-center opacity-50 mt-20">
-            <Volume2 className="w-12 h-12 mb-4" />
-            <p className="text-lg">Waiting for speech...</p>
+        {!hasContent ? (
+          <div
+            style={{
+              height: "100%",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              color: "#333",
+              fontSize: "0.8rem",
+            }}
+          >
+            Waiting for speech…
           </div>
         ) : (
           <>
-            {/* 1. LATEST STREAM AT THE VERY TOP (Large Font) */}
-            <div className="shrink-0 mb-4 transition-all duration-300">
-              {hasInterim ? (
-                <div className="text-3xl md:text-5xl text-white font-medium leading-tight italic">
-                  {interimText}
-                  <span className="typing-cursor ml-2" />
-                </div>
-              ) : (
-                transcripts.length > 0 && (
-                  <div className="text-3xl md:text-5xl text-white font-medium leading-tight">
-                    {transcripts[transcripts.length - 1].text}
-                  </div>
-                )
-              )}
-            </div>
+            {/* Finalized transcripts — same style as interim for seamless flow */}
+            {transcripts.map((t, i) => (
+              <p
+                key={i}
+                style={{
+                  fontSize: "clamp(1rem, 3vw, 1.5rem)",
+                  lineHeight: 1.7,
+                  fontWeight: 400,
+                  color: "#e0e0e0",
+                  margin: "0 0 2px 0",
+                }}
+              >
+                {t.text}
+              </p>
+            ))}
 
-            {/* 2. HISTORY AT THE BOTTOM (Small Font, Reverse Chronological) */}
-            <div className="flex flex-col gap-3 opacity-60">
-              {[...transcripts]
-                .slice(0, hasInterim ? transcripts.length : transcripts.length - 1)
-                .reverse()
-                .map((t, i) => (
-                  <div 
-                    key={i} 
-                    className="text-base md:text-xl text-gray-300 leading-relaxed"
-                  >
-                    {t.text}
-                  </div>
-                ))}
-            </div>
+            {/* Interim text — SAME STYLE as final, just has a cursor */}
+            {hasInterim && (
+              <p
+                style={{
+                  fontSize: "clamp(1rem, 3vw, 1.5rem)",
+                  lineHeight: 1.7,
+                  fontWeight: 400,
+                  color: "#e0e0e0",
+                  margin: "0 0 2px 0",
+                }}
+              >
+                {interimText}
+                <span className="typing-cursor" />
+              </p>
+            )}
+
+            {/* Scroll anchor */}
+            <div ref={bottomRef} style={{ height: "1px" }} />
           </>
         )}
       </div>
 
+      {/* ─── Session ended overlay ─── */}
       {sessionEnded && (
-        <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/80">
-          <div className="bg-white/10 p-8 rounded-2xl text-center border border-white/20">
-            <WifiOff size={48} className="text-red-400 mx-auto mb-4" />
-            <h2 className="text-2xl font-bold text-white mb-2">Session Ended</h2>
-            <button onClick={() => navigate("/")} className="mt-4 px-6 py-2 bg-white/20 rounded-lg text-white">
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            zIndex: 50,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            background: "rgba(0,0,0,0.9)",
+          }}
+        >
+          <div
+            style={{
+              border: "1px solid var(--color-error)",
+              padding: "40px",
+              textAlign: "center",
+              background: "#050505",
+            }}
+          >
+            <WifiOff
+              style={{
+                width: "32px",
+                height: "32px",
+                color: "var(--color-error)",
+                margin: "0 auto 16px",
+                display: "block",
+              }}
+            />
+            <h2
+              style={{
+                fontSize: "1rem",
+                fontWeight: 500,
+                color: "#e0e0e0",
+                marginBottom: "16px",
+              }}
+            >
+              Session Ended
+            </h2>
+            <button
+              onClick={() => navigate("/live")}
+              style={{
+                background: "transparent",
+                border: "1px solid #1a1a1a",
+                color: "#777",
+                fontFamily: "var(--font-mono)",
+                fontSize: "0.8rem",
+                padding: "8px 24px",
+                cursor: "pointer",
+              }}
+            >
               Return Home
             </button>
           </div>
@@ -217,11 +441,26 @@ export default function TargetView({ sessionId }: TargetViewProps) {
 
 function TargetConnectionBadge({ state }: { state: ConnectionState }) {
   const Icon = state === "connected" ? Wifi : WifiOff;
-  const color = state === "connected" ? "#10b981" : state === "connecting" ? "#f59e0b" : "#ef4444";
+  const color =
+    state === "connected"
+      ? "var(--color-accent)"
+      : state === "connecting"
+      ? "var(--color-warning)"
+      : "#444";
   return (
-    <div className="flex items-center gap-1.5">
-      <div className="w-2 h-2 rounded-full" style={{ backgroundColor: color }} />
-      <Icon className="w-3.5 h-3.5 text-gray-400" />
+    <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+      <div
+        style={{
+          width: "6px",
+          height: "6px",
+          background: color,
+          boxShadow:
+            state === "connected"
+              ? "0 0 6px var(--color-accent-glow)"
+              : "none",
+        }}
+      />
+      <Icon style={{ width: "12px", height: "12px", color: "#444" }} />
     </div>
   );
 }

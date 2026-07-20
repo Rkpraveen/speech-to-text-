@@ -3,30 +3,29 @@ I think you can build a **production-like MVP completely free**. The key is choo
 ## Architecture
 
 ```text
-                  Source System
-                 (React/Web App)
-                       │
-              Web Audio API
-                       │
-                Silero VAD (Browser)
-                       │
+              Source System (WRITE)
+             (React/Web App)
+                   │
+          Web Audio API + Silero VAD
+                   │
             Only Speech Frames
-                       │
-                  WebSocket
-                       │
-                 FastAPI Server
-                       │
-         ┌─────────────┴─────────────┐
-         │                           │
-   Faster-Whisper              Session Manager
-         │                           │
-         └─────────────┬─────────────┘
-                       │
-             Partial/Final Transcript
-                       │
-                  WebSocket
-                       │
-                Target System
+                   │
+              WebSocket (binary)
+                   │
+             FastAPI Server
+                   │
+         ┌─────────┴─────────┐
+         │                   │
+  Faster-Whisper       Session Manager
+  (Groq Turbo)         (asyncio.Queue)
+         │                   │
+         └─────────┬─────────┘
+                   │
+         Partial/Final Transcript
+                   │
+           SSE (text/event-stream)
+                   │
+          Target System (READ)
 ```
 
 ## Component Selection
@@ -35,9 +34,9 @@ I think you can build a **production-like MVP completely free**. The key is choo
 | --------- | --------------------------------- | ----------------------- |
 | Frontend  | React + Web Audio API             | Free                    |
 | VAD       | Silero VAD (`@ricky0123/vad-web`) | Free                    |
-| Transport | WebSocket                         | Free                    |
+| Transport | WebSocket (source) + SSE (target) | Free                    |
 | Backend   | FastAPI                           | Free                    |
-| STT       | Faster-Whisper                    | Free (runs locally)     |
+| STT       | Faster-Whisper (large-v3-turbo)   | Free (runs locally)     |
 | GPU       | Optional (CUDA)                   | Free if you have NVIDIA |
 | CPU       | Works on CPU too                  | Free                    |
 
@@ -100,7 +99,7 @@ For an MVP:
 * `medium` → better accuracy, higher latency.
 * `large-v3` → best accuracy but requires more compute.
 
-If you have a GPU, `large-v3` is an excellent choice.
+If you have a GPU, `large-v3-turbo` is an excellent choice — faster than `large-v3` with comparable accuracy.
 
 ---
 
@@ -194,9 +193,9 @@ Once the MVP is working, you can add:
 For a **free, high-accuracy MVP**, I would use:
 
 * **Frontend:** React + Web Audio API + `@ricky0123/vad-web`
-* **Transport:** WebSockets
+* **Transport:** WebSocket (source → server) + SSE (server → target)
 * **Backend:** FastAPI
-* **Speech-to-text:** Faster-Whisper (`large-v3` if you have sufficient hardware, otherwise `small` or `medium`)
+* **Speech-to-text:** Faster-Whisper (`large-v3-turbo` if you have sufficient hardware, otherwise `small` or `medium`)
 * **Session management:** In-memory dictionary keyed by `sessionId`
 
 This design is simple, inexpensive, and scalable enough for your target of fewer than 10 concurrent sessions.

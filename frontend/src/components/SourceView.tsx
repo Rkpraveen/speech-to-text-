@@ -3,16 +3,16 @@ import { useNavigate } from "react-router-dom";
 import { useAuth } from "@/contexts/AuthContext";
 import { API_BASE } from "@/lib/config";
 import { useMicVAD } from "@ricky0123/vad-react";
-import { Mic, MicOff, Radio, Wifi, WifiOff, Copy, Clock } from "lucide-react";
+import { Mic, MicOff, Wifi, WifiOff, Copy, Clock } from "lucide-react";
 import { useWebSocket, type ConnectionState } from "@/hooks/useWebSocket";
-import { float32ToWav, concatFloat32Arrays } from "@/lib/audio-utils";
+import { float32ToLinear16, concatFloat32Arrays } from "@/lib/audio-utils";
 import { formatTime } from "@/lib/utils";
 
 // Auto-detect WebSocket URL from current page (works with ngrok proxy)
 const WS_BASE = import.meta.env.VITE_WS_URL || "wss://speech-to-text-mdof.onrender.com";
 
-// Interim streaming interval: send accumulated audio every ~1 second
-const INTERIM_INTERVAL_MS = 1000;
+// Stream audio to backend every N ms (continuous streaming for Deepgram)
+const STREAM_INTERVAL_MS = 250;
 
 interface TranscriptMessage {
   type: string;
@@ -32,14 +32,15 @@ export default function SourceView({ sessionId }: SourceViewProps) {
   const [interimText, setInterimText] = useState("");
   const [wordCount, setWordCount] = useState(0);
   const [chunksSent, setChunksSent] = useState(0);
+  const [showEndConfirm, setShowEndConfirm] = useState(false);
+  const [copyFeedback, setCopyFeedback] = useState(false);
   const navigate = useNavigate();
   const { token } = useAuth();
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  // Interim streaming refs
-  const speechFramesRef = useRef<Float32Array[]>([]);
-  const interimTimerRef = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
-  const isSpeakingRef = useRef(false);
+  // Audio streaming refs
+  const audioFramesRef = useRef<Float32Array[]>([]);
+  const streamTimerRef = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
 
   // WebSocket connection to backend
   const handleMessage = useCallback((data: TranscriptMessage) => {
@@ -58,90 +59,73 @@ export default function SourceView({ sessionId }: SourceViewProps) {
     }
   }, []);
 
-  const { connectionState, connect, disconnect, sendBinary, sendJson } = useWebSocket({
+  const { connectionState, connect, disconnect, sendBinary } = useWebSocket({
     url: `${WS_BASE}/ws/source/${sessionId}`,
     onMessage: handleMessage,
   });
 
   /**
-   * Send an audio chunk with a signal type prefix.
-   * Protocol: send JSON {"signal": type} then binary audio data.
+   * Send accumulated audio frames as raw Linear16 PCM to the backend.
+   * The backend forwards this directly to Deepgram's streaming WebSocket.
+   * No signal protocol needed — Deepgram handles interim/final distinction.
    */
-  const sendAudioChunk = useCallback((audioBuffer: ArrayBuffer, signal: "interim" | "final") => {
+  const flushAudioFrames = useCallback(() => {
+    if (audioFramesRef.current.length === 0) return;
     if (connectionState !== "connected") return;
-    sendJson({ signal });
-    sendBinary(audioBuffer);
+
+    // Grab and clear the accumulated frames
+    const frames = audioFramesRef.current;
+    audioFramesRef.current = [];
+
+    // Concatenate and convert to Linear16 PCM
+    const combined = concatFloat32Arrays(frames);
+    const pcmBuffer = float32ToLinear16(combined);
+
+    // Send raw PCM bytes to backend (no WAV header, no signal prefix)
+    sendBinary(pcmBuffer);
     setChunksSent((prev) => prev + 1);
-  }, [connectionState, sendJson, sendBinary]);
+  }, [connectionState, sendBinary]);
 
   /**
-   * Send the currently accumulated speech frames as an interim chunk.
+   * Start the continuous audio streaming timer.
+   * Fires every STREAM_INTERVAL_MS to flush accumulated audio frames.
    */
-  const sendInterimChunk = useCallback(() => {
-    if (speechFramesRef.current.length === 0) return;
-    if (connectionState !== "connected") return;
+  const startStreamTimer = useCallback(() => {
+    stopStreamTimer();
+    streamTimerRef.current = setInterval(() => {
+      flushAudioFrames();
+    }, STREAM_INTERVAL_MS);
+  }, [flushAudioFrames]);
 
-    // Concatenate all accumulated frames
-    const combined = concatFloat32Arrays(speechFramesRef.current);
-    const wavBlob = float32ToWav(combined, 16000);
-    wavBlob.arrayBuffer().then((buffer) => {
-      sendAudioChunk(buffer, "interim");
-    });
-  }, [connectionState, sendAudioChunk]);
-
-  /**
-   * Start the interim streaming timer — fires every INTERIM_INTERVAL_MS
-   * while the user is speaking.
-   */
-  const startInterimTimer = useCallback(() => {
-    stopInterimTimer();
-    interimTimerRef.current = setInterval(() => {
-      if (isSpeakingRef.current) {
-        sendInterimChunk();
-      }
-    }, INTERIM_INTERVAL_MS);
-  }, [sendInterimChunk]);
-
-  const stopInterimTimer = useCallback(() => {
-    if (interimTimerRef.current !== undefined) {
-      clearInterval(interimTimerRef.current);
-      interimTimerRef.current = undefined;
+  const stopStreamTimer = useCallback(() => {
+    if (streamTimerRef.current !== undefined) {
+      clearInterval(streamTimerRef.current);
+      streamTimerRef.current = undefined;
     }
   }, []);
 
-  // VAD — Voice Activity Detection
+  // VAD — Voice Activity Detection (used for UI indicators only)
+  // Audio is streamed continuously regardless of speech detection.
+  // Deepgram's own VAD handles endpointing on the server side.
   const vad = useMicVAD({
     startOnLoad: true,
     baseAssetPath: "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.30/dist/",
     onnxWASMBasePath: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/",
 
     onSpeechStart: () => {
-      // User started speaking — reset the frame buffer and start interim timer
-      speechFramesRef.current = [];
-      isSpeakingRef.current = true;
-      startInterimTimer();
+      // UI indicator only — streaming is already happening
     },
 
-    onFrameProcessed: (probs: { isSpeech: number }, frame: Float32Array) => {
-      // Accumulate every speech frame into the buffer
-      // (VAD fires this callback ~30x/sec with 512 samples each)
-      if (isSpeakingRef.current && probs.isSpeech > 0.3) {
-        speechFramesRef.current.push(new Float32Array(frame));
-      }
+    onFrameProcessed: (_probs: { isSpeech: number }, frame: Float32Array) => {
+      // Accumulate EVERY frame (speech or silence) for continuous streaming.
+      // Deepgram handles VAD on its side — we just send everything.
+      audioFramesRef.current.push(new Float32Array(frame));
     },
 
-    onSpeechEnd: (audio: Float32Array) => {
-      // User stopped speaking — send the full utterance as a "final" chunk
-      isSpeakingRef.current = false;
-      stopInterimTimer();
-      speechFramesRef.current = [];
-
-      if (connectionState !== "connected") return;
-
-      const wavBlob = float32ToWav(audio, 16000);
-      wavBlob.arrayBuffer().then((buffer) => {
-        sendAudioChunk(buffer, "final");
-      });
+    onSpeechEnd: () => {
+      // Flush any remaining frames immediately when speech ends
+      // for slightly faster final delivery
+      flushAudioFrames();
     },
 
     positiveSpeechThreshold: 0.8,
@@ -150,38 +134,68 @@ export default function SourceView({ sessionId }: SourceViewProps) {
     redemptionMs: 150,
   });
 
-  // Auto-connect WebSocket on load
+  // Load existing transcripts from DB on mount (survives reload)
+  useEffect(() => {
+    fetch(`${API_BASE}/api/sessions/${sessionId}/transcripts`)
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.transcripts && data.transcripts.length > 0) {
+          const restored = data.transcripts.map(
+            (t: { text: string; timestamp?: string }) => ({
+              type: "final",
+              text: t.text,
+              timestamp: t.timestamp,
+            })
+          );
+          setTranscripts(restored);
+          setWordCount(
+            restored.reduce(
+              (sum: number, r: { text?: string }) =>
+                sum + (r.text?.split(/\s+/).length || 0),
+              0
+            )
+          );
+        }
+      })
+      .catch((err) => console.error("[SourceView] Failed to load history:", err));
+  }, [sessionId]);
+
+  // Auto-connect WebSocket and start streaming on load
   useEffect(() => {
     connect();
     setIsRecording(true);
-  }, [connect]);
+    startStreamTimer();
+  }, [connect, startStreamTimer]);
 
-  // Cleanup interim timer on unmount
+  // Cleanup stream timer on unmount
   useEffect(() => {
-    return () => stopInterimTimer();
-  }, [stopInterimTimer]);
+    return () => stopStreamTimer();
+  }, [stopStreamTimer]);
 
   // Start/stop recording (manual toggle still supported)
   const toggleRecording = useCallback(() => {
     if (isRecording) {
       vad.pause();
+      flushAudioFrames(); // Send any remaining audio
+      stopStreamTimer();
       disconnect();
-      stopInterimTimer();
       setIsRecording(false);
       setInterimText("");
     } else {
       connect();
+      startStreamTimer();
       vad.start();
       setIsRecording(true);
     }
-  }, [isRecording, vad, connect, disconnect, stopInterimTimer]);
+  }, [isRecording, vad, connect, disconnect, startStreamTimer, stopStreamTimer, flushAudioFrames]);
 
   // End Session
   const endSession = async () => {
     try {
       vad.pause();
+      flushAudioFrames();
+      stopStreamTimer();
       disconnect();
-      stopInterimTimer();
       
       await fetch(`${API_BASE}/api/sessions/${sessionId}/end`, {
         method: "POST",
@@ -209,28 +223,74 @@ export default function SourceView({ sessionId }: SourceViewProps) {
     const text = transcripts
       .filter((t) => t.type === "final" || t.type === "transcript")
       .map((t) => t.text)
+      .filter(Boolean)
       .join(" ");
     navigator.clipboard.writeText(text);
+    setCopyFeedback(true);
+    setTimeout(() => setCopyFeedback(false), 2000);
   };
 
   return (
-    <div className="h-full flex flex-col" style={{ background: "var(--color-bg-primary)" }}>
+    <>
+    <div
+      style={{
+        height: "100%",
+        display: "flex",
+        flexDirection: "column",
+        background: "#000",
+        fontFamily: "var(--font-mono)",
+        color: "#e0e0e0",
+      }}
+    >
       {/* Header */}
-      <header className="flex items-center justify-between px-6 py-4 border-b" style={{ borderColor: "var(--color-border)" }}>
-        <div className="flex items-center gap-3">
-          <Radio className="w-5 h-5" style={{ color: "var(--color-accent)" }} />
-          <h1 className="text-lg font-semibold" style={{ color: "var(--color-text-primary)" }}>
-            Speech Source
-          </h1>
-          <span className="text-xs font-mono px-2 py-1 rounded-md" style={{ background: "var(--color-bg-card)", color: "var(--color-text-secondary)" }}>
+      <header
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          padding: "12px 20px",
+          borderBottom: "1px solid #1a1a1a",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+          <span
+            style={{
+              fontSize: "0.85rem",
+              fontWeight: 500,
+              color: "#e0e0e0",
+            }}
+          >
+            Source
+          </span>
+          <span
+            style={{
+              fontSize: "0.75rem",
+              padding: "2px 8px",
+              border: "1px solid #1a1a1a",
+              color: "#777",
+              letterSpacing: "0.1em",
+            }}
+          >
             {sessionId}
           </span>
         </div>
-        <div className="flex items-center gap-3">
+        <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
           <ConnectionBadge state={connectionState} />
-          <button 
-            onClick={endSession}
-            className="px-4 py-2 bg-red-500/10 text-red-500 text-sm font-medium rounded-md border border-red-500/20 hover:bg-red-500/20 transition-colors"
+          <button
+            onClick={() => setShowEndConfirm(true)}
+            style={{
+              background: "transparent",
+              border: "1px solid var(--color-error)",
+              color: "var(--color-error)",
+              fontFamily: "var(--font-mono)",
+              fontSize: "0.75rem",
+              fontWeight: 500,
+              padding: "6px 16px",
+              cursor: "pointer",
+              transition: "background 0.15s",
+            }}
+            onMouseEnter={(e) => (e.currentTarget.style.background = "var(--color-error-dim)")}
+            onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
           >
             End Session
           </button>
@@ -238,18 +298,28 @@ export default function SourceView({ sessionId }: SourceViewProps) {
       </header>
 
       {/* Main Content */}
-      <div className="flex-1 flex flex-col items-center justify-center gap-8 p-6">
+      <div
+        style={{
+          flex: 1,
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+          gap: "32px",
+          padding: "24px",
+        }}
+      >
         {/* Waveform Visualizer */}
-        <div className="waveform-container" style={{ height: "60px" }}>
+        <div className="waveform-container" style={{ height: "48px" }}>
           {Array.from({ length: 24 }).map((_, i) => (
             <div
               key={i}
               className={`waveform-bar ${vad.userSpeaking ? "active" : ""}`}
               style={{
                 height: vad.userSpeaking
-                  ? `${Math.random() * 50 + 10}px`
-                  : "6px",
-                opacity: vad.userSpeaking ? 1 : 0.3,
+                  ? `${(Math.sin(i * 0.7 + Date.now() * 0.005) * 0.5 + 0.5) * 40 + 8}px`
+                  : "4px",
+                opacity: vad.userSpeaking ? 1 : 0.2,
                 transition: "height 0.08s ease, opacity 0.3s ease",
               }}
             />
@@ -263,51 +333,99 @@ export default function SourceView({ sessionId }: SourceViewProps) {
           disabled={vad.loading}
         >
           {vad.loading ? (
-            <div className="animate-spin w-8 h-8 border-2 border-t-transparent rounded-full" style={{ borderColor: "var(--color-text-muted)", borderTopColor: "transparent" }} />
+            <div
+              style={{
+                width: "24px",
+                height: "24px",
+                border: "2px solid #333",
+                borderTopColor: "transparent",
+                animation: "pulse 1s linear infinite",
+              }}
+            />
           ) : isRecording ? (
-            <MicOff className="w-8 h-8" />
+            <MicOff style={{ width: "28px", height: "28px" }} />
           ) : (
-            <Mic className="w-8 h-8" />
+            <Mic style={{ width: "28px", height: "28px" }} />
           )}
         </button>
 
-        <p className="text-sm" style={{ color: "var(--color-text-secondary)" }}>
+        <p
+          style={{
+            fontSize: "0.75rem",
+            color: vad.userSpeaking ? "var(--color-accent)" : "#555",
+          }}
+        >
           {vad.loading
-            ? "Loading VAD model..."
+            ? "Loading…"
             : isRecording
             ? vad.userSpeaking
-              ? "🎙️ Streaming live..."
-              : "Waiting for speech..."
-            : "Click to start recording"}
+              ? "Streaming"
+              : "Listening"
+            : "Stopped"}
         </p>
 
         {/* Stats Row */}
-        <div className="flex items-center gap-6">
-          <StatBadge icon={<Radio className="w-3.5 h-3.5" />} label="Chunks" value={chunksSent} />
-          <StatBadge icon={<Copy className="w-3.5 h-3.5" />} label="Words" value={wordCount} />
+        <div style={{ display: "flex", alignItems: "center", gap: "24px" }}>
+          <StatBadge label="Chunks" value={chunksSent} />
+          <StatBadge label="Words" value={wordCount} />
         </div>
       </div>
 
       {/* Transcript Preview (Bottom Panel) */}
-      <div className="glass-card mx-4 mb-4" style={{ maxHeight: "35vh" }}>
-        <div className="flex items-center justify-between px-4 py-3 border-b" style={{ borderColor: "var(--color-border)" }}>
-          <span className="text-xs font-medium" style={{ color: "var(--color-text-secondary)" }}>
-            Transcript Preview
+      <div
+        className="flat-card"
+        style={{ margin: "0 16px 16px", maxHeight: "35vh" }}
+      >
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            padding: "8px 12px",
+            borderBottom: "1px solid #1a1a1a",
+          }}
+        >
+          <span style={{ fontSize: "0.7rem", color: "#555" }}>
+            Transcript
           </span>
           {transcripts.length > 0 && (
             <button
               onClick={copyTranscripts}
-              className="text-xs flex items-center gap-1 px-2 py-1 rounded-md transition-colors hover:bg-white/5"
-              style={{ color: "var(--color-text-muted)" }}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "4px",
+                fontSize: "0.65rem",
+                color: "#444",
+                background: "none",
+                border: "none",
+                cursor: "pointer",
+                padding: "2px 6px",
+              }}
             >
-              <Copy className="w-3 h-3" /> Copy
+               <Copy style={{ width: "10px", height: "10px" }} />
+               {copyFeedback ? "Copied!" : "Copy"}
             </button>
           )}
         </div>
-        <div ref={scrollRef} className="overflow-y-auto p-4" style={{ maxHeight: "calc(35vh - 44px)" }}>
+        <div
+          ref={scrollRef}
+          style={{
+            overflowY: "auto",
+            padding: "8px 12px",
+            maxHeight: "calc(35vh - 36px)",
+          }}
+        >
           {transcripts.length === 0 && !interimText ? (
-            <p className="text-sm text-center py-4" style={{ color: "var(--color-text-muted)" }}>
-              Transcripts will appear here...
+            <p
+              style={{
+                fontSize: "0.75rem",
+                textAlign: "center",
+                padding: "16px 0",
+                color: "#333",
+              }}
+            >
+              Transcripts will appear here
             </p>
           ) : (
             <>
@@ -316,11 +434,25 @@ export default function SourceView({ sessionId }: SourceViewProps) {
                 .filter((t) => t.type === "final" || t.type === "transcript")
                 .map((t, i) => (
                   <div key={i} className="transcript-entry">
-                    <div className="flex items-center gap-2 timestamp">
-                      <Clock className="w-3 h-3" />
+                    <div
+                      className="timestamp"
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "6px",
+                      }}
+                    >
+                      <Clock style={{ width: "10px", height: "10px" }} />
                       {t.timestamp && formatTime(t.timestamp)}
                       {t.latency_ms && (
-                        <span style={{ color: t.latency_ms < 300 ? "var(--color-success)" : "var(--color-warning)" }}>
+                        <span
+                          style={{
+                            color:
+                              t.latency_ms < 300
+                                ? "var(--color-accent)"
+                                : "var(--color-warning)",
+                          }}
+                        >
                           {t.latency_ms}ms
                         </span>
                       )}
@@ -332,11 +464,28 @@ export default function SourceView({ sessionId }: SourceViewProps) {
               {/* Live interim preview */}
               {interimText && (
                 <div className="transcript-entry interim-entry">
-                  <div className="flex items-center gap-2 timestamp">
+                  <div
+                    className="timestamp"
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "6px",
+                    }}
+                  >
                     <span className="interim-dot" />
-                    <span style={{ color: "var(--color-accent)", fontSize: "0.7rem" }}>LIVE</span>
+                    <span
+                      style={{
+                        color: "var(--color-accent)",
+                        fontSize: "0.6rem",
+                      }}
+                    >
+                      LIVE
+                    </span>
                   </div>
-                  <div className="text" style={{ color: "var(--color-text-secondary)", fontStyle: "italic" }}>
+                  <div
+                    className="text"
+                    style={{ color: "#777", fontStyle: "normal" }}
+                  >
                     {interimText}
                   </div>
                 </div>
@@ -346,35 +495,138 @@ export default function SourceView({ sessionId }: SourceViewProps) {
         </div>
       </div>
     </div>
+
+      {/* End Session Confirmation Overlay */}
+      {showEndConfirm && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            zIndex: 100,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            background: "rgba(0,0,0,0.85)",
+          }}
+        >
+          <div
+            style={{
+              border: "1px solid var(--color-error)",
+              padding: "32px 40px",
+              textAlign: "center",
+              background: "#050505",
+              maxWidth: "360px",
+            }}
+          >
+            <h3
+              style={{
+                fontSize: "0.95rem",
+                fontWeight: 500,
+                color: "#e0e0e0",
+                marginBottom: "12px",
+              }}
+            >
+              End this session?
+            </h3>
+            <p
+              style={{
+                fontSize: "0.75rem",
+                color: "#777",
+                marginBottom: "24px",
+                lineHeight: 1.6,
+              }}
+            >
+              This will disconnect all targets and stop transcription. This action cannot be undone.
+            </p>
+            <div style={{ display: "flex", gap: "12px", justifyContent: "center" }}>
+              <button
+                onClick={() => setShowEndConfirm(false)}
+                style={{
+                  background: "transparent",
+                  border: "1px solid #1a1a1a",
+                  color: "#777",
+                  fontFamily: "var(--font-mono)",
+                  fontSize: "0.75rem",
+                  padding: "8px 20px",
+                  cursor: "pointer",
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  setShowEndConfirm(false);
+                  endSession();
+                }}
+                style={{
+                  background: "var(--color-error-dim)",
+                  border: "1px solid var(--color-error)",
+                  color: "var(--color-error)",
+                  fontFamily: "var(--font-mono)",
+                  fontSize: "0.75rem",
+                  fontWeight: 500,
+                  padding: "8px 20px",
+                  cursor: "pointer",
+                }}
+              >
+                End Session
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
   );
 }
-
 /* ─── Sub-components ──────────────────────────────────────────────── */
 
 function ConnectionBadge({ state }: { state: ConnectionState }) {
   const labels: Record<ConnectionState, string> = {
     connected: "Connected",
-    connecting: "Connecting...",
+    connecting: "Connecting",
     disconnected: "Offline",
     error: "Error",
   };
   const Icon = state === "connected" ? Wifi : WifiOff;
+  const color =
+    state === "connected"
+      ? "var(--color-accent)"
+      : state === "connecting"
+      ? "var(--color-warning)"
+      : "#444";
 
   return (
-    <div className="flex items-center gap-2 text-xs font-medium" style={{ color: "var(--color-text-secondary)" }}>
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: "6px",
+        fontSize: "0.7rem",
+        color: "#777",
+      }}
+    >
       <span className={`status-dot ${state}`} />
-      <Icon className="w-3.5 h-3.5" />
-      {labels[state]}
+      <Icon style={{ width: "12px", height: "12px", color: "#555" }} />
+      <span style={{ color }}>{labels[state]}</span>
     </div>
   );
 }
 
-function StatBadge({ icon, label, value }: { icon: React.ReactNode; label: string; value: number }) {
+function StatBadge({ label, value }: { label: string; value: number }) {
   return (
-    <div className="flex items-center gap-2 text-xs" style={{ color: "var(--color-text-muted)" }}>
-      {icon}
-      <span>{label}:</span>
-      <span className="font-mono font-medium" style={{ color: "var(--color-text-secondary)" }}>{value}</span>
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: "6px",
+        fontSize: "0.7rem",
+        color: "#444",
+      }}
+    >
+      <span>{label}</span>
+      <span style={{ color: "#777", fontVariantNumeric: "tabular-nums" }}>
+        {value}
+      </span>
     </div>
   );
 }

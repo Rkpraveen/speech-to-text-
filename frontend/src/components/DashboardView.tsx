@@ -1,8 +1,8 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '@/contexts/AuthContext';
 import { API_BASE } from '@/lib/config';
-import { Mic, Radio, LogOut, Loader2 } from 'lucide-react';
+import { Mic, Wifi, LogOut, Clock } from 'lucide-react';
 
 export default function DashboardView() {
   const { username, token, logout } = useAuth();
@@ -10,6 +10,21 @@ export default function DashboardView() {
   const [joinSessionId, setJoinSessionId] = useState('');
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState('');
+  const [sessions, setSessions] = useState<any[]>([]);
+  const [loadingSessions, setLoadingSessions] = useState(true);
+
+  // Load session history
+  useEffect(() => {
+    fetch(`${API_BASE}/api/sessions`, {
+      headers: { 'Authorization': `Bearer ${token}` }
+    })
+      .then(res => res.json())
+      .then(data => {
+        setSessions(data.sessions || []);
+      })
+      .catch(err => console.error('Failed to load sessions:', err))
+      .finally(() => setLoadingSessions(false));
+  }, [token]);
 
   const handleCreateSession = async () => {
     setCreating(true);
@@ -39,86 +54,354 @@ export default function DashboardView() {
   };
 
   return (
-    <div className="min-h-screen bg-[#0a0a0f] text-white p-6 relative overflow-hidden">
-      {/* Background accents */}
-      <div className="absolute top-0 right-0 w-[600px] h-[600px] bg-blue-500/10 rounded-full blur-[120px] pointer-events-none" />
-      <div className="absolute bottom-0 left-0 w-[600px] h-[600px] bg-purple-500/10 rounded-full blur-[120px] pointer-events-none" />
-
-      <div className="max-w-4xl mx-auto relative z-10">
-        <header className="flex items-center justify-between py-6 mb-12">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 bg-gradient-to-br from-blue-500 to-purple-600 rounded-xl flex items-center justify-center">
-              <Radio className="text-white w-5 h-5" />
-            </div>
-            <h1 className="text-2xl font-bold tracking-tight">SpeechSync</h1>
-          </div>
-          <div className="flex items-center gap-4">
-            <span className="text-gray-400">Hello, <strong className="text-white">{username}</strong></span>
+    <div
+      style={{
+        minHeight: '100vh',
+        background: '#000',
+        color: '#e0e0e0',
+        padding: '24px',
+        fontFamily: 'var(--font-mono)',
+      }}
+    >
+      <div style={{ maxWidth: '720px', margin: '0 auto' }}>
+        {/* Header */}
+        <header
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            padding: '24px 0',
+            marginBottom: '48px',
+            borderBottom: '1px solid #1a1a1a',
+          }}
+        >
+          <h1 style={{ fontSize: '1rem', fontWeight: 500 }}>
+            SpeechSync
+          </h1>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+            <span style={{ fontSize: '0.75rem', color: '#555' }}>
+              {username}
+            </span>
             <button
               onClick={logout}
-              className="p-2 hover:bg-white/10 rounded-lg text-gray-400 hover:text-white transition-colors flex items-center gap-2"
-              title="Logout"
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '6px',
+                background: 'none',
+                border: '1px solid #1a1a1a',
+                color: '#555',
+                fontFamily: 'var(--font-mono)',
+                fontSize: '0.7rem',
+                padding: '6px 12px',
+                cursor: 'pointer',
+                transition: 'border-color 0.15s, color 0.15s',
+              }}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.borderColor = '#333';
+                e.currentTarget.style.color = '#999';
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.borderColor = '#1a1a1a';
+                e.currentTarget.style.color = '#555';
+              }}
             >
-              <LogOut size={18} />
-              <span className="text-sm">Logout</span>
+              <LogOut style={{ width: '12px', height: '12px' }} />
+              Logout
             </button>
           </div>
         </header>
 
         {error && (
-          <div className="bg-red-500/10 border border-red-500/20 text-red-400 p-4 rounded-xl mb-8">
+          <div
+            style={{
+              border: '1px solid var(--color-error)',
+              color: 'var(--color-error)',
+              padding: '10px 12px',
+              fontSize: '0.75rem',
+              marginBottom: '24px',
+              background: 'var(--color-error-dim)',
+            }}
+          >
             {error}
           </div>
         )}
 
-        <div className="grid md:grid-cols-2 gap-6">
-          {/* Create Session Card */}
-          <div className="bg-white/5 border border-white/10 rounded-2xl p-8 backdrop-blur-sm flex flex-col items-center text-center hover:bg-white/[0.07] transition-all">
-            <div className="w-20 h-20 bg-blue-500/20 text-blue-400 rounded-full flex items-center justify-center mb-6">
-              <Mic size={40} />
-            </div>
-            <h2 className="text-2xl font-bold mb-3">Host a Stream</h2>
-            <p className="text-gray-400 mb-8 max-w-sm">
-              Generate a new session ID and start transcribing your speech in real-time.
+        {/* Two-column cards */}
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
+            gap: '1px',
+            border: '1px solid #1a1a1a',
+          }}
+        >
+          {/* Host a Stream */}
+          <div
+            style={{
+              background: '#050505',
+              padding: '40px 32px',
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'flex-start',
+              borderRight: '1px solid #1a1a1a',
+            }}
+          >
+            <Mic
+              style={{
+                width: '20px',
+                height: '20px',
+                color: 'var(--color-accent)',
+                marginBottom: '20px',
+              }}
+            />
+            <h2
+              style={{
+                fontSize: '0.9rem',
+                fontWeight: 500,
+                marginBottom: '12px',
+                color: '#e0e0e0',
+              }}
+            >
+              Host a Stream
+            </h2>
+            <p
+              style={{
+                fontSize: '0.75rem',
+                color: '#555',
+                lineHeight: 1.6,
+                marginBottom: '32px',
+              }}
+            >
+              Create a new session and start transcribing speech in real-time.
             </p>
             <button
               onClick={handleCreateSession}
               disabled={creating}
-              className="w-full bg-blue-600 hover:bg-blue-500 text-white font-semibold py-4 rounded-xl transition-all flex justify-center items-center gap-2 disabled:opacity-50"
+              style={{
+                width: '100%',
+                background: 'transparent',
+                border: '1px solid var(--color-accent)',
+                color: 'var(--color-accent)',
+                fontFamily: 'var(--font-mono)',
+                fontSize: '0.8rem',
+                fontWeight: 500,
+                padding: '12px',
+                cursor: creating ? 'default' : 'pointer',
+                opacity: creating ? 0.4 : 1,
+                transition: 'opacity 0.15s',
+                marginTop: 'auto',
+              }}
             >
-              {creating ? <Loader2 className="animate-spin" /> : 'Start New Live Session'}
+              {creating ? 'Creating…' : 'New Session'}
             </button>
           </div>
 
-          {/* Join Session Card */}
-          <div className="bg-white/5 border border-white/10 rounded-2xl p-8 backdrop-blur-sm flex flex-col items-center text-center hover:bg-white/[0.07] transition-all">
-            <div className="w-20 h-20 bg-purple-500/20 text-purple-400 rounded-full flex items-center justify-center mb-6">
-              <Radio size={40} />
-            </div>
-            <h2 className="text-2xl font-bold mb-3">Join a Stream</h2>
-            <p className="text-gray-400 mb-8 max-w-sm">
-              Enter a 6-character session ID provided by a host to listen in live.
+          {/* Join a Stream */}
+          <div
+            style={{
+              background: '#050505',
+              padding: '40px 32px',
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'flex-start',
+            }}
+          >
+            <Wifi
+              style={{
+                width: '20px',
+                height: '20px',
+                color: 'var(--color-accent)',
+                marginBottom: '20px',
+              }}
+            />
+            <h2
+              style={{
+                fontSize: '0.9rem',
+                fontWeight: 500,
+                marginBottom: '12px',
+                color: '#e0e0e0',
+              }}
+            >
+              Join a Stream
+            </h2>
+            <p
+              style={{
+                fontSize: '0.75rem',
+                color: '#555',
+                lineHeight: 1.6,
+                marginBottom: '32px',
+              }}
+            >
+              Enter a session code to receive live transcription.
             </p>
-            <form onSubmit={handleJoinSession} className="w-full mt-auto">
-              <div className="flex flex-col gap-3">
-                <input
-                  type="text"
-                  placeholder="e.g. M9ARWM"
-                  value={joinSessionId}
-                  onChange={(e) => setJoinSessionId(e.target.value.toUpperCase())}
-                  className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-4 text-white uppercase text-center text-lg focus:outline-none focus:border-purple-500/50 focus:ring-1 focus:ring-purple-500/50 transition-all"
-                  maxLength={6}
-                />
-                <button
-                  type="submit"
-                  disabled={joinSessionId.length < 2}
-                  className="w-full bg-purple-600 hover:bg-purple-500 text-white font-semibold py-4 rounded-xl transition-all disabled:opacity-50"
-                >
-                  Join Live Stream
-                </button>
-              </div>
+            <form
+              onSubmit={handleJoinSession}
+              style={{ width: '100%', marginTop: 'auto' }}
+            >
+              <input
+                type="text"
+                placeholder="Session code"
+                value={joinSessionId}
+                onChange={(e) => setJoinSessionId(e.target.value.toUpperCase())}
+                maxLength={6}
+                style={{
+                  width: '100%',
+                  background: '#000',
+                  border: '1px solid #1a1a1a',
+                  padding: '10px 12px',
+                  color: '#e0e0e0',
+                  fontFamily: 'var(--font-mono)',
+                  fontSize: '0.95rem',
+                  textTransform: 'uppercase',
+                  textAlign: 'center',
+                  letterSpacing: '0.15em',
+                  outline: 'none',
+                  marginBottom: '8px',
+                }}
+                onFocus={(e) => (e.currentTarget.style.borderColor = 'var(--color-accent)')}
+                onBlur={(e) => (e.currentTarget.style.borderColor = '#1a1a1a')}
+              />
+              <button
+                type="submit"
+                disabled={joinSessionId.length < 2}
+                style={{
+                  width: '100%',
+                  background: 'transparent',
+                  border: '1px solid #1a1a1a',
+                  color: '#777',
+                  fontFamily: 'var(--font-mono)',
+                  fontSize: '0.8rem',
+                  fontWeight: 500,
+                  padding: '12px',
+                  cursor: joinSessionId.length < 2 ? 'default' : 'pointer',
+                  opacity: joinSessionId.length < 2 ? 0.3 : 1,
+                  transition: 'opacity 0.15s, border-color 0.15s, color 0.15s',
+                }}
+                onMouseEnter={(e) => {
+                  if (joinSessionId.length >= 2) {
+                    e.currentTarget.style.borderColor = 'var(--color-accent)';
+                    e.currentTarget.style.color = 'var(--color-accent)';
+                  }
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.borderColor = '#1a1a1a';
+                  e.currentTarget.style.color = '#777';
+                }}
+              >
+                Join
+              </button>
             </form>
           </div>
+        </div>
+        {/* Session History */}
+        <div
+          style={{
+            marginTop: '48px',
+            borderTop: '1px solid #1a1a1a',
+            paddingTop: '32px',
+          }}
+        >
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '8px',
+              marginBottom: '20px',
+            }}
+          >
+            <Clock
+              style={{ width: '16px', height: '16px', color: '#555' }}
+            />
+            <h2
+              style={{
+                fontSize: '0.85rem',
+                fontWeight: 500,
+                color: '#e0e0e0',
+              }}
+            >
+              Session History
+            </h2>
+          </div>
+
+          {loadingSessions ? (
+            <p style={{ fontSize: '0.75rem', color: '#444' }}>Loading…</p>
+          ) : sessions.length === 0 ? (
+            <p style={{ fontSize: '0.75rem', color: '#444' }}>
+              No sessions yet. Create your first session above.
+            </p>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '1px' }}>
+              {sessions.map((s) => (
+                <div
+                  key={s.session_id}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    padding: '12px 16px',
+                    background: '#050505',
+                    border: '1px solid #1a1a1a',
+                    cursor: 'pointer',
+                    transition: 'border-color 0.15s',
+                  }}
+                  onMouseEnter={(e) =>
+                    (e.currentTarget.style.borderColor = '#2a2a2a')
+                  }
+                  onMouseLeave={(e) =>
+                    (e.currentTarget.style.borderColor = '#1a1a1a')
+                  }
+                  onClick={() =>
+                    navigate(`/live?session=${s.session_id}`)
+                  }
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                    <span
+                      style={{
+                        fontSize: '0.8rem',
+                        color: '#e0e0e0',
+                        letterSpacing: '0.1em',
+                        fontWeight: 500,
+                      }}
+                    >
+                      {s.session_id}
+                    </span>
+                    <span
+                      style={{
+                        fontSize: '0.65rem',
+                        padding: '2px 6px',
+                        background:
+                          s.status === 'active'
+                            ? 'var(--color-accent-dim)'
+                            : 'transparent',
+                        border: `1px solid ${
+                          s.status === 'active'
+                            ? 'var(--color-accent)'
+                            : '#1a1a1a'
+                        }`,
+                        color:
+                          s.status === 'active'
+                            ? 'var(--color-accent)'
+                            : '#555',
+                      }}
+                    >
+                      {s.status}
+                    </span>
+                  </div>
+                  <span style={{ fontSize: '0.65rem', color: '#444' }}>
+                    {s.started_at
+                      ? new Date(s.started_at).toLocaleDateString([], {
+                          month: 'short',
+                          day: 'numeric',
+                          hour: '2-digit',
+                          minute: '2-digit',
+                        })
+                      : ''}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       </div>
     </div>

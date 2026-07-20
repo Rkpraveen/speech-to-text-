@@ -1,7 +1,22 @@
 /**
  * Audio utility functions for converting between formats.
- * Handles Float32Array (from VAD) → 16kHz mono PCM WAV (for Groq Whisper).
+ * Handles Float32Array (from VAD) → Linear16 PCM (for Deepgram streaming)
+ * and WAV format (for batch APIs).
  */
+
+/**
+ * Convert Float32Array audio samples to raw Linear16 PCM ArrayBuffer.
+ * This is the format Deepgram streaming expects (no WAV header).
+ * Float32 range [-1, 1] → Int16 range [-32768, 32767]
+ */
+export function float32ToLinear16(samples: Float32Array): ArrayBuffer {
+  const int16 = new Int16Array(samples.length);
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  return int16.buffer;
+}
 
 /**
  * Convert Float32Array audio samples to a WAV Blob.
