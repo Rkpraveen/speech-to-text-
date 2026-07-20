@@ -1,18 +1,18 @@
 """
-FastAPI application with WebSocket endpoints for real-time speech-to-text.
+FastAPI application with WebSocket + SSE endpoints for real-time speech-to-text.
 
 Architecture:
-  Laptop (Source) → WS binary audio → FastAPI → Groq Whisper → WS text → Mobile (Target)
-                                                              ↘ async → PostgreSQL
+  Laptop (Source) → WS binary audio → FastAPI → Deepgram Nova-3 (streaming) → SSE → Mobile (Target)
+                                                                             ↘ async → PostgreSQL
 """
 
 import asyncio
-import time
 import json
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, status
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, Request, status
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
@@ -22,17 +22,19 @@ import string
 from app.auth import get_password_hash, verify_password, create_access_token, decode_access_token
 from app.database import create_user, get_user_by_username
 
-from app.groq_client import transcribe
+from app.deepgram_client import connect_deepgram, close_deepgram
 from app.session_manager import (
     register_source,
     unregister_source,
-    register_target,
-    unregister_target,
+    subscribe_target,
+    unsubscribe_target,
     broadcast_to_targets,
     notify_source,
     list_active_sessions,
+    get_or_create_session,
+    get_session,
 )
-from app.database import get_pool, close_pool, save_session, end_session, save_transcript, get_sessions, get_session_transcripts
+from app.database import get_pool, close_pool, save_session, end_session, save_transcript, get_sessions, get_session_transcripts, get_session_owner
 
 
 @asynccontextmanager
@@ -50,7 +52,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Speech-to-Text Server",
-    description="Real-time transcription via Groq Whisper",
+    description="Real-time transcription via Deepgram Nova-3 Streaming",
     lifespan=lifespan,
 )
 
@@ -117,13 +119,20 @@ async def create_session_endpoint(current_user: dict = Depends(get_current_user)
 
 @app.post("/api/sessions/{session_id}/end")
 async def end_session_endpoint(session_id: str, current_user: dict = Depends(get_current_user)):
-    # You could optionally verify the user owns the session here
+    # Verify the user owns the session
+    owner_id = await get_session_owner(session_id)
+    if owner_id is not None and owner_id != current_user["id"]:
+        raise HTTPException(status_code=403, detail="You do not own this session")
     await end_session(session_id)
     # Broadcast to targets that the session has ended
     await broadcast_to_targets(session_id, {
         "type": "end_session",
         "message": "The host has ended this live session."
     })
+    # Mark the in-memory session as explicitly ended so WS disconnect doesn't re-end it
+    session = get_session(session_id)
+    if session:
+        session.is_recording = False
     return {"status": "ended"}
 
 @app.get("/api/me")
@@ -133,25 +142,29 @@ async def get_me(current_user: dict = Depends(get_current_user)):
 # --- REST Endpoints (History) ---
 
 
-# ─── WebSocket: Source (Laptop sends audio) ──────────────────────────────────
+# ─── WebSocket: Source (Laptop streams audio → Deepgram) ─────────────────────
 
 
 @app.websocket("/ws/source/{session_id}")
 async def ws_source(websocket: WebSocket, session_id: str):
     """
-    Laptop connects here to stream audio.
-    Supports dual-channel streaming:
-      - "interim" signals: transcribe and broadcast as live preview (no DB save)
-      - "final" signals: transcribe, broadcast, and persist to DB
-    The source sends a JSON text message {"signal": "interim"|"final"} before
-    each binary audio chunk to indicate the type.
+    Laptop connects here to stream raw Linear16 PCM audio.
+    Audio is proxied to Deepgram Nova-3 streaming WebSocket.
+    Deepgram handles VAD, endpointing, and returns interim/final transcripts.
+    Results are broadcast to SSE targets in real-time.
     """
     await websocket.accept()
-    session = register_source(session_id, websocket)
-    print(f"[Source] Connected: session={session_id}")
 
-    # Create session in DB (async, non-blocking)
-    asyncio.create_task(_safe_db_op(save_session(session_id)))
+    # Prevent duplicate source connections to the same session
+    existing_session = get_session(session_id)
+    if existing_session and existing_session.source_ws is not None:
+        await websocket.send_json({"type": "error", "message": "Session already has an active source"})
+        await websocket.close(code=4001)
+        return
+
+    session = register_source(session_id, websocket)
+    session_ended_explicitly = False  # Track if session was ended via API
+    print(f"[Source] Connected: session={session_id}")
 
     # Notify targets that source is connected
     await broadcast_to_targets(session_id, {
@@ -160,138 +173,163 @@ async def ws_source(websocket: WebSocket, session_id: str):
         "timestamp": _now(),
     })
 
-    # Track the pending signal type for the next binary chunk
-    pending_signal = "final"  # default for backward compatibility
+    # ── Deepgram transcript callback ──
+    # Accumulate is_final segments into a full utterance.
+    # speech_final = True means the speaker paused (end of utterance).
+    utterance_parts = []
+
+    async def on_transcript(text: str, is_final: bool, speech_final: bool):
+        """Called by Deepgram receive loop when a transcript arrives."""
+        if not is_final:
+            # Interim result — live preview, changes as speaker continues
+            transcript_message = {
+                "type": "interim",
+                "text": text,
+                "timestamp": _now(),
+            }
+            await broadcast_to_targets(session_id, transcript_message)
+            await notify_source(session_id, transcript_message)
+            print(f"[Interim] {text[:60]}")
+        else:
+            # Final result for this audio segment
+            utterance_parts.append(text)
+
+            if speech_final:
+                # Speaker paused — combine all parts into complete utterance
+                full_text = " ".join(utterance_parts)
+                utterance_parts.clear()
+
+                transcript_message = {
+                    "type": "final",
+                    "text": full_text,
+                    "timestamp": _now(),
+                }
+                await broadcast_to_targets(session_id, transcript_message)
+                await notify_source(session_id, transcript_message)
+                print(f"[Final] {full_text[:80]}")
+
+                # Save to DB (fire-and-forget)
+                asyncio.create_task(
+                    _safe_db_op(save_transcript(session_id, full_text, None))
+                )
+            else:
+                # is_final but speech continues — send as interim preview
+                current_text = " ".join(utterance_parts)
+                transcript_message = {
+                    "type": "interim",
+                    "text": current_text,
+                    "timestamp": _now(),
+                }
+                await broadcast_to_targets(session_id, transcript_message)
+                await notify_source(session_id, transcript_message)
+
+    # ── Open Deepgram streaming connection ──
+    dg_ws = None
+    receive_task = None
 
     try:
+        dg_ws, receive_task = await connect_deepgram(on_transcript)
+        print(f"[Source] Deepgram stream opened for session={session_id}")
+
+        # ── Main loop: receive audio from browser, forward to Deepgram ──
         while True:
-            # Receive message from laptop
             message = await websocket.receive()
 
-            # ── Handle text messages (signals + ping) ──
+            # Handle text messages (ping/pong keepalive)
             if "text" in message:
-                text_msg = message["text"]
-
-                if text_msg == "ping":
+                if message["text"] == "ping":
                     await websocket.send_text("pong")
-                    continue
-
-                # Parse signal JSON: {"signal": "interim"} or {"signal": "final"}
-                try:
-                    parsed = json.loads(text_msg)
-                    if "signal" in parsed:
-                        pending_signal = parsed["signal"]  # "interim" or "final"
-                        continue
-                except (json.JSONDecodeError, TypeError):
-                    pass
-
                 continue
 
-            # ── Handle binary messages (audio chunks) ──
+            # Handle binary messages (raw Linear16 PCM audio)
             if "bytes" not in message:
                 continue
 
-            data = message["bytes"]
-
-            if len(data) < 100:
-                # Too small, likely an empty frame
-                pending_signal = "final"
+            audio_data = message["bytes"]
+            if len(audio_data) < 10:
                 continue
 
-            # Capture the signal type for this chunk, then reset to default
-            chunk_type = pending_signal
-            pending_signal = "final"
-
-            # ── HOT PATH: Transcribe + Deliver ──
-            t_start = time.perf_counter()
-
-            # Run Groq transcription (blocking but fast ~100-200ms)
-            result = await asyncio.to_thread(transcribe, data)
-
-            t_transcribe = time.perf_counter()
-
-            text = result.get("text", "")
-            if not text:
-                continue
-
-            duration_ms = result.get("duration")
-            latency_ms = round((t_transcribe - t_start) * 1000, 1)
-
-            transcript_message = {
-                "type": chunk_type,  # "interim" or "final"
-                "text": text,
-                "timestamp": _now(),
-                "latency_ms": latency_ms,
-                "audio_duration": duration_ms,
-            }
-
-            # Push to all target WebSockets (mobile)
-            await broadcast_to_targets(session_id, transcript_message)
-
-            # Echo back to source (laptop) for preview
-            await notify_source(session_id, transcript_message)
-
-            if chunk_type == "interim":
-                print(f"[Interim] ({latency_ms}ms) {text[:60]}...")
-            else:
-                print(f"[Final] ({latency_ms}ms) {text[:80]}")
-
-                # Fire-and-forget: save ONLY final transcripts to DB
-                asyncio.create_task(
-                    _safe_db_op(save_transcript(session_id, text, duration_ms))
-                )
+            # Forward raw audio directly to Deepgram
+            await dg_ws.send(audio_data)
 
     except WebSocketDisconnect:
         print(f"[Source] Disconnected: session={session_id}")
     except Exception as e:
         print(f"[Source] Error: {e}")
     finally:
+        # Close Deepgram connection
+        if dg_ws and receive_task:
+            await close_deepgram(dg_ws, receive_task)
+            print(f"[Source] Deepgram stream closed for session={session_id}")
+
         unregister_source(session_id)
         await broadcast_to_targets(session_id, {
             "type": "status",
             "status": "source_disconnected",
             "timestamp": _now(),
         })
-        asyncio.create_task(_safe_db_op(end_session(session_id)))
+        # Only end session in DB if it wasn't already ended explicitly via API
+        if not session.is_recording and session_ended_explicitly is False:
+            # Session was stopped by API endpoint already, skip DB end
+            pass
+        else:
+            session_ended_explicitly = True
+            asyncio.create_task(_safe_db_op(end_session(session_id)))
 
 
-# ─── WebSocket: Target (Mobile receives text) ───────────────────────────────
+# ─── SSE: Target (Mobile receives text via Server-Sent Events) ──────────────
 
 
-@app.websocket("/ws/target/{session_id}")
-async def ws_target(websocket: WebSocket, session_id: str):
+@app.get("/api/stream/{session_id}")
+async def sse_target(session_id: str, request: Request):
     """
-    Mobile connects here to receive live transcripts.
-    Sends JSON messages with transcript text.
+    Mobile connects here to receive live transcripts via SSE.
+    Read-only stream — no data flows back from target.
     """
-    await websocket.accept()
-    session = register_target(session_id, websocket)
-    print(f"[Target] Connected: session={session_id}")
+    session = get_or_create_session(session_id)
+    subscriber_id, queue = subscribe_target(session_id)
+    print(f"[Target SSE] Connected: session={session_id}, sub={subscriber_id[:8]}")
 
-    # Send welcome message with session info
-    await websocket.send_json({
-        "type": "status",
-        "status": "connected",
-        "session_id": session_id,
-        "has_source": session.source_ws is not None,
-        "timestamp": _now(),
-    })
+    async def event_generator():
+        # Send welcome event
+        welcome = json.dumps({
+            "type": "status",
+            "status": "connected",
+            "session_id": session_id,
+            "has_source": session.source_ws is not None,
+            "timestamp": _now(),
+        })
+        yield f"data: {welcome}\n\n"
 
-    try:
-        while True:
-            # Keep connection alive; targets mostly receive, not send
-            msg = await websocket.receive_text()
+        try:
+            while True:
+                # Check if client disconnected
+                if await request.is_disconnected():
+                    break
 
-            # Handle ping/pong for keepalive
-            if msg == "ping":
-                await websocket.send_text("pong")
+                try:
+                    # Wait for a message with a timeout (for disconnect checking)
+                    message = await asyncio.wait_for(queue.get(), timeout=30.0)
+                    payload = json.dumps(message)
+                    yield f"data: {payload}\n\n"
+                except asyncio.TimeoutError:
+                    # Send a keep-alive comment to prevent connection timeout
+                    yield ": keepalive\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            unsubscribe_target(session_id, subscriber_id)
+            print(f"[Target SSE] Disconnected: session={session_id}, sub={subscriber_id[:8]}")
 
-    except WebSocketDisconnect:
-        print(f"[Target] Disconnected: session={session_id}")
-    except Exception as e:
-        print(f"[Target] Error: {e}")
-    finally:
-        unregister_target(session_id, websocket)
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+        },
+    )
 
 
 # ─── REST API: Sessions & History ────────────────────────────────────────────

@@ -33,7 +33,7 @@ def transcribe(audio_bytes: bytes, language: str = "en") -> dict:
     try:
         transcription = client.audio.transcriptions.create(
             file=("audio.wav", audio_bytes),
-            model="whisper-large-v3",
+            model="whisper-large-v3-turbo",
             temperature=0,
             language=language,
             response_format="verbose_json",

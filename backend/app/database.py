@@ -43,28 +43,21 @@ async def save_session(session_id: str, user_id: int | None = None):
         """
         INSERT INTO sessions (session_id, user_id, started_at, status)
         VALUES ($1, $2, NOW(), 'active')
-        ON CONFLICT (session_id) DO UPDATE SET status = 'active', user_id = EXCLUDED.user_id
+        ON CONFLICT (session_id) DO UPDATE SET status = 'active',
+            user_id = COALESCE(EXCLUDED.user_id, sessions.user_id)
         """,
         session_id,
         user_id,
     )
 
 async def end_session(session_id: str):
-    """Mark a session as completed and set the ended_at timestamp."""
+    """Mark a session as ended and set the ended_at timestamp."""
     pool = await get_pool()
     await pool.execute(
         """
         UPDATE sessions
-        SET status = 'completed', ended_at = NOW()
-        WHERE session_id = $1
-        """,
-        session_id,
-    )
-    pool = await get_pool()
-    await pool.execute(
-        """
-        UPDATE sessions SET ended_at = NOW(), status = 'ended'
-        WHERE session_id = $1
+        SET status = 'ended', ended_at = NOW()
+        WHERE session_id = $1 AND status != 'ended'
         """,
         session_id,
     )
@@ -128,3 +121,12 @@ async def create_user(username: str, password_hash: str):
         username, password_hash
     )
     return dict(row)
+
+
+async def get_session_owner(session_id: str) -> int | None:
+    """Get the user_id that owns a session, or None if not found."""
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT user_id FROM sessions WHERE session_id = $1", session_id
+    )
+    return row["user_id"] if row else None

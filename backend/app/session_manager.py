@@ -1,21 +1,25 @@
 """
-In-memory session manager for WebSocket connections.
-Tracks source (laptop) and target (mobile) connections per session.
+In-memory session manager.
+Source (laptop) connects via WebSocket (write access).
+Targets (mobile) subscribe via asyncio.Queue (read access via SSE).
 """
 
+import asyncio
+import json
+import uuid
 from fastapi import WebSocket
 from dataclasses import dataclass, field
-from datetime import datetime
-import json
+from datetime import datetime, timezone
 
 
 @dataclass
 class Session:
     session_id: str
     source_ws: WebSocket | None = None
-    target_ws_set: set = field(default_factory=set)
+    # Each SSE subscriber gets a unique queue keyed by subscriber_id
+    target_queues: dict[str, asyncio.Queue] = field(default_factory=dict)
     transcripts: list = field(default_factory=list)
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     is_recording: bool = False
 
 
@@ -51,22 +55,27 @@ def unregister_source(session_id: str):
         session.is_recording = False
 
 
-def register_target(session_id: str, ws: WebSocket) -> Session:
-    """Register a target (mobile) WebSocket for a session."""
+def subscribe_target(session_id: str) -> tuple[str, asyncio.Queue]:
+    """
+    Subscribe a target (mobile) to a session via an asyncio.Queue.
+    Returns (subscriber_id, queue) — the SSE endpoint reads from this queue.
+    """
     session = get_or_create_session(session_id)
-    session.target_ws_set.add(ws)
-    return session
+    subscriber_id = str(uuid.uuid4())
+    queue: asyncio.Queue = asyncio.Queue()
+    session.target_queues[subscriber_id] = queue
+    return subscriber_id, queue
 
 
-def unregister_target(session_id: str, ws: WebSocket):
-    """Remove target WebSocket when mobile disconnects."""
+def unsubscribe_target(session_id: str, subscriber_id: str):
+    """Remove a target subscriber when SSE connection closes."""
     session = _sessions.get(session_id)
     if session:
-        session.target_ws_set.discard(ws)
+        session.target_queues.pop(subscriber_id, None)
 
 
 async def broadcast_to_targets(session_id: str, message: dict):
-    """Send a message to all target WebSockets for a session."""
+    """Put a message into all target subscriber queues for a session."""
     session = _sessions.get(session_id)
     if not session:
         return
@@ -76,18 +85,18 @@ async def broadcast_to_targets(session_id: str, message: dict):
     if message.get("type") != "interim":
         session.transcripts.append(message)
 
-    # Broadcast to all connected targets
-    dead_targets = set()
-    payload = json.dumps(message)
-
-    for ws in session.target_ws_set:
+    # Push to all subscriber queues (non-blocking)
+    dead_subscribers = []
+    for sub_id, queue in session.target_queues.items():
         try:
-            await ws.send_text(payload)
-        except Exception:
-            dead_targets.add(ws)
+            queue.put_nowait(message)
+        except asyncio.QueueFull:
+            # Queue is full — subscriber is too slow, drop it
+            dead_subscribers.append(sub_id)
 
-    # Clean up dead connections
-    session.target_ws_set -= dead_targets
+    # Clean up dead subscribers
+    for sub_id in dead_subscribers:
+        session.target_queues.pop(sub_id, None)
 
 
 async def notify_source(session_id: str, message: dict):
@@ -106,7 +115,7 @@ def list_active_sessions() -> list[dict]:
         {
             "session_id": s.session_id,
             "has_source": s.source_ws is not None,
-            "target_count": len(s.target_ws_set),
+            "target_count": len(s.target_queues),
             "transcript_count": len(s.transcripts),
             "is_recording": s.is_recording,
             "created_at": s.created_at.isoformat(),
